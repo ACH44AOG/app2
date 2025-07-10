@@ -22,12 +22,6 @@ build_number = 1
 [tool.flet.app]
 module = "main"
 path = "src"
-exclude = ["product_images"]
-
-[tool.flet.compile]
-app = false
-packages = false
-cleanup = false
 
 [tool.flet.splash]
 color = "#4a6da7"
@@ -35,10 +29,6 @@ dark_color = "#183e63"
 web = false
 ios = false
 android = false
-
-[tool.flet.deep_linking]
-scheme = "productmanager"
-host = "localhost"
 
 [tool.flet.ios]
 team = "ACH44"
