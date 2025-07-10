@@ -16,7 +16,7 @@ from flet import (
 # === إعدادات البرنامج ===
 DB_PATH = 'products.db'
 SETTINGS_DB_PATH = 'bot_settings.db'
-IMAGES_FOLDER = os.path.join(os.path.dirname(__file__), 'product_images')
+IMAGES_FOLDER = os.path.join(os.getcwd(), 'product_images')
 IMAGE_SIZE = (300, 300)
 
 # إضافة هنا: متغيرات إدارة البوت
