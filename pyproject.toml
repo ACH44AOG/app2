@@ -21,7 +21,7 @@ build_number = 1
 
 [tool.flet.app]
 module = "main"
-path = "."
+path = "src"
 exclude = ["product_images"]
 
 [tool.flet.compile]
