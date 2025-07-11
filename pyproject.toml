@@ -19,7 +19,7 @@ copyright = "حقوق النشر محفوظة باسم ACH--AOG  (C) 2025"
 build_number = 1
 
 [tool.flet.app]
-path = "src/main.py"
+path = "src"
 
 [tool.flet.splash]
 color = "#4a6da7"
