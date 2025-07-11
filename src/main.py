@@ -16,7 +16,7 @@ from flet import (
 # === إعدادات البرنامج ===
 DB_PATH = 'products.db'
 SETTINGS_DB_PATH = 'bot_settings.db'
-IMAGES_FOLDER = os.path.join(os.getcwd(), 'product_images')
+IMAGES_FOLDER = os.path.join(os.path.dirname(__file__), 'product_images')
 IMAGE_SIZE = (300, 300)
 
 # إضافة هنا: متغيرات إدارة البوت
@@ -77,7 +77,6 @@ def send_telegram_notification(message: str):
             ).fetchone()
 
         if not settings or not settings[0] or not settings[1]:
-            print("⚠️ إعدادات البوت غير مكتملة")
             return
 
         bot_token, chat_id = settings
@@ -91,7 +90,7 @@ def send_telegram_notification(message: str):
                     parse_mode="Markdown"  # لتمييز النصوص المهمة
                 )
             except Exception as e:
-                print(f"فشل إرسال الإشعار: {e}")
+                pass
 
         if telegram_bot_loop and telegram_bot_loop.is_running():
             asyncio.run_coroutine_threadsafe(_send(), telegram_bot_loop)
@@ -99,7 +98,7 @@ def send_telegram_notification(message: str):
             asyncio.run(_send())
 
     except Exception as e:
-        print(f"❌ فشل إرسال إشعار تيليجرام: {e}")
+        pass
 
 
 async def send_telegram_message(bot_token, chat_id, message):
@@ -107,7 +106,7 @@ async def send_telegram_message(bot_token, chat_id, message):
         bot = Bot(token=bot_token)
         await bot.send_message(chat_id=chat_id, text=message)
     except Exception as e:
-        print(f"فشل إرسال رسالة Telegram: {e}")
+        pass
 
 async def send_telegram_photo(bot_token, chat_id, photo_path, caption=None):
     try:
@@ -115,7 +114,7 @@ async def send_telegram_photo(bot_token, chat_id, photo_path, caption=None):
         with open(photo_path, 'rb') as photo:
             await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption)
     except Exception as e:
-        print(f"فشل إرسال صورة Telegram: {e}")
+        pass
 
 def is_admin(user_id):
     with sqlite3.connect(SETTINGS_DB_PATH) as conn:
@@ -134,7 +133,6 @@ def add_admin(user_id, username=None):
             )
         return True
     except Exception as e:
-        print(f"خطأ في إضافة المسؤول: {e}")
         return False
 
 def remove_admin(user_id):
@@ -145,7 +143,6 @@ def remove_admin(user_id):
                 (str(user_id),))
         return True
     except Exception as e:
-        print(f"خطأ في حذف المسؤول: {e}")
         return False
 
 def list_admins():
@@ -158,11 +155,10 @@ def list_admins():
 # === واجهة المستخدم الرئيسية ===
 def main(page: Page):
     page.title = "نظام إدارة المنتجات"
-    page.window_width = 1200
-    page.window_height = 800
     page.theme_mode = ThemeMode.LIGHT
     page.vertical_alignment = MainAxisAlignment.START
     page.horizontal_alignment = CrossAxisAlignment.CENTER
+    page.window.full_screen = True
     
     # حالة التطبيق
     selected_products = {}
@@ -474,7 +470,7 @@ def main(page: Page):
                 resize_image(dst, dst, IMAGE_SIZE)
                 image_path = dst
             except Exception as e:
-                print(f"خطأ في حفظ الصورة: {e}")
+            
                 show_snackbar("حدث خطأ أثناء حفظ الصورة")
         
         with sqlite3.connect(DB_PATH) as conn:
@@ -672,7 +668,7 @@ def main(page: Page):
                     if old_image and os.path.exists(old_image):
                         os.remove(old_image)
                 except Exception as e:
-                    print(f"خطأ في حفظ الصورة الجديدة: {e}")
+                    
                     show_snackbar("حدث خطأ أثناء حفظ الصورة الجديدة")
             
             conn.execute(
@@ -1359,7 +1355,7 @@ def main(page: Page):
                                 selected_products.pop(product_id, None)
                             update_total_banner()
                         except Exception as ex:
-                            print(f"Error in select callback: {ex}")
+                            pass
                     return callback
                 
                 product_card = Card(
@@ -1612,7 +1608,7 @@ def main(page: Page):
                             if os.path.exists(thumbnail_path):
                                 os.remove(thumbnail_path)
                         except Exception as img_err:
-                            print(f"تحذير: لم يتم حذف الصورة - {img_err}")
+                            pass
 
                 # 4. إرسال إشعار
                 message = f"تم حذف المنتج:\n{product_name}"
@@ -1629,10 +1625,10 @@ def main(page: Page):
                 page.close(dlg)
 
             except sqlite3.Error as db_err:
-                print(f"خطأ في قاعدة البيانات: {db_err}")
+                
                 show_snackbar(f"خطأ في قاعدة البيانات: {db_err}")
             except Exception as ex:
-                print(f"خطأ غير متوقع: {ex}")
+                
                 show_snackbar(f"خطأ غير متوقع: {ex}")
             finally:
                 page.update()
@@ -1821,7 +1817,7 @@ def main(page: Page):
                 )
             )
         else:
-            print(f"تحذير: المحتوى للفهرس {index} غير مهيء")
+            pass
 
     def start_telegram_bot():
         from telegram import BotCommand
@@ -1848,7 +1844,7 @@ def main(page: Page):
 
         # تأكد من عدم تشغيل البوت مسبقاً
         if telegram_bot_thread and telegram_bot_thread.is_alive():
-            print("البوت يعمل بالفعل")
+            pass
             return
         
         # تحقق من وجود إعدادات البوت
@@ -1858,7 +1854,7 @@ def main(page: Page):
             ).fetchone()
         
         if not settings or not settings[0]:
-            print("لم يتم العثور على إعدادات البوت أو توكن البوت")
+            pass
             return
 
         async def download_image(bot, file_id, product_id):
@@ -1873,7 +1869,7 @@ def main(page: Page):
                 
                 return destination
             except Exception as e:
-                print(f"فشل في تحميل الصورة: {e}")
+                
                 return None
 
         async def run_bot():
@@ -2079,7 +2075,7 @@ def main(page: Page):
                                     text=f"تمت إضافة منتج جديد:\n{name}\nالسعر: {price} درهم\nالكمية: {quantity}"
                                 )
                             except Exception as e:
-                                print(f"فشل إرسال إشعار: {e}")
+                                pass
 
                     except ValueError:
                         await update.message.reply_text("❌ خطأ في القيم المدخلة! تأكد أن السعر رقم والكمية عدد صحيح")
@@ -2220,7 +2216,7 @@ def main(page: Page):
                                 try:
                                     os.remove(product[1])
                                 except Exception as e:
-                                    print(f"فشل في حذف الصورة: {e}")
+                                    pass
                         
                         await update.message.reply_text(
                             f"✅ تم حذف المنتج بنجاح:\n{product[0]}"
@@ -2334,7 +2330,7 @@ def main(page: Page):
                 # تشغيل البوت
                 await telegram_bot_app.initialize()
                 await telegram_bot_app.start()
-                print("✅ بوت التليجرام يعمل الآن")
+                
                 
                 if settings and settings[1]:
                     try:
@@ -2343,13 +2339,13 @@ def main(page: Page):
                             text="🤖 تم تشغيل بوت إدارة المتجر بنجاح"
                         )
                     except Exception as e:
-                        print(f"فشل إرسال رسالة التشغيل: {e}")
+                        pass
                 
                 await telegram_bot_app.updater.start_polling()
                 await asyncio.Event().wait()
 
             except Exception as e:
-                print(f"حدث خطأ في تشغيل البوت: {str(e)}")
+                
                 if settings and settings[1]:
                     try:
                         bot = Bot(token=settings[0])
@@ -2371,7 +2367,7 @@ def main(page: Page):
 
         telegram_bot_thread = threading.Thread(target=run_async, daemon=True)
         telegram_bot_thread.start()
-        print("✅ تم بدء تشغيل بوت التليجرام")
+        
 
     def stop_telegram_bot():
         global telegram_bot_app, telegram_bot_thread, telegram_bot_loop
@@ -2383,7 +2379,7 @@ def main(page: Page):
                 telegram_bot_app = None
                 telegram_bot_thread = None
                 telegram_bot_loop = None
-                print("✅ تم إيقاف بوت التليجرام")
+                
                 
                 with sqlite3.connect(SETTINGS_DB_PATH) as conn:
                     settings = conn.execute(
@@ -2398,10 +2394,10 @@ def main(page: Page):
                             text="🛑 تم إيقاف بوت إدارة المتجر"
                         ))
                     except Exception as e:
-                        print(f"فشل إرسال رسالة الإيقاف: {e}")
+                        pass
                         
             except Exception as e:
-                print(f"خطأ في إيقاف البوت: {e}")
+                pass
 
     def restart_telegram_bot():
         stop_telegram_bot()
