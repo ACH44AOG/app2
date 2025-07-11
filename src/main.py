@@ -2405,4 +2405,4 @@ def main(page: Page):
     start_telegram_bot()
     navigate_to(0)
 
-app(target=main)
+app(target=main,assets_dir='assets/')
