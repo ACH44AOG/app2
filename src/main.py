@@ -1,2408 +1,695 @@
-from flet import *
-import os
-import shutil
-import sqlite3
-from telegram import Bot
-import asyncio
-import sqlite3
-import threading
-from PIL import Image as PILImage
-from datetime import datetime
-from flet import (
-    AlertDialog, Column, Container, Divider, Row, SnackBar, 
-    SnackBarBehavior, Text, TextButton, Colors, FontWeight,
-    RoundedRectangleBorder, ScrollMode, TextAlign, alignment
-)
-# === إعدادات البرنامج ===
-DB_PATH = 'products.db'
-SETTINGS_DB_PATH = 'bot_settings.db'
-IMAGES_FOLDER = os.path.join(os.path.dirname(__file__), 'product_images')
-IMAGE_SIZE = (300, 300)
+#ده برنامج مراقبة صحة اللابتوب
+# بيقيس أداء الجهاز وينبهك لو في مشاكل
 
-# إضافة هنا: متغيرات إدارة البوت
-telegram_bot_app = None  # سيحتوي على تطبيق البوت
-telegram_bot_loop = None  # سيحتوي على event loop الخاص بالبوت
-telegram_bot_thread = None  # ثيل تشغيل البوت
-# === إنشاء المجلدات والجداول ===
-os.makedirs(IMAGES_FOLDER, exist_ok=True)
+# استدعاء المكتبات المطلوبة
+import time  # للتحكم في التوقيت والانتظار
+import threading  # لتشغيل أكثر من مهمة في نفس الوقت
+import json  # لقراءة وكتابة ملفات الإعدادات
+import os  # للتعامل مع نظام الملفات والمجلدات
+import psutil  # لمراقبة أداء النظام (معالج، ذاكرة، بطارية، إلخ)
+import flet as ft  # لإنشاء واجهة المستخدم
+from datetime import datetime  # للتعامل مع التواريخ والأوقات
 
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute('''CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            price REAL NOT NULL,
-            quantity INTEGER NOT NULL,
-            sold INTEGER DEFAULT 0,
-            image TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
-        conn.execute('''CREATE TABLE IF NOT EXISTS sales (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER,
-            quantity INTEGER,
-            sale_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(product_id) REFERENCES products(id)
-        )''')
+# محاولة استدعاء مكتبة كروت الشاشة لو موجودة
+try:
+    import GPUtil
+except:
+    GPUtil = None  # لو مش موجودة خليها فاضية
 
-def init_settings_db():
-    with sqlite3.connect(SETTINGS_DB_PATH) as conn:
-        conn.execute('''CREATE TABLE IF NOT EXISTS telegram_bot (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_token TEXT NOT NULL,
-            chat_id TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
-        conn.execute('''CREATE TABLE IF NOT EXISTS admin_users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL UNIQUE,
-            username TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''')
+# ملف الإعدادات
+CONFIG_FILE = "assets/config_pro.json"
 
-init_db()
-init_settings_db()
+# الإعدادات الأساسية الافتراضية
+DEFAULT_CONFIG = {
+    "cpu_alert": 85,  # إنذار عند وصول المعالج لـ85%
+    "ram_alert": 85,  # إنذار عند وصول الذاكرة لـ85%
+    "battery_alert": 15,  # إنذار عند وصول البطارية لـ15%
+    "temp_alert": 85,  # إنذار عند وصول درجة الحرارة لـ85
+    "poll_interval": 0.5,  # سرعة التحديث (كل نصف ثانية)
+    "auto_start": True,  # التشغيل التلقائي مع الويندوز
+    "enable_gpu": True,  # تفعيل مراقبة كرت الشاشة
+    "enable_wifi": True,  # تفعيل مراقبة الشبكة
+    "show_alerts": True,  # عرض التنبيهات
+    "system_notifications": True  # الإشعارات في شريط المهام
+}
 
-# === أدوات مساعدة ===
-def resize_image(input_path, output_path, size):
-    with PILImage.open(input_path) as img:
-        img.thumbnail(size, PILImage.LANCZOS)
-        img.save(output_path)
-
-def send_telegram_notification(message: str):
-    try:
-        with sqlite3.connect(SETTINGS_DB_PATH) as conn:
-            settings = conn.execute(
-                "SELECT bot_token, chat_id FROM telegram_bot ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-
-        if not settings or not settings[0] or not settings[1]:
-            return
-
-        bot_token, chat_id = settings
-
-        async def _send():
-            try:
-                bot = Bot(token=bot_token)
-                await bot.send_message(
-                    chat_id=chat_id, 
-                    text=message,
-                    parse_mode="Markdown"  # لتمييز النصوص المهمة
-                )
-            except Exception as e:
-                pass
-
-        if telegram_bot_loop and telegram_bot_loop.is_running():
-            asyncio.run_coroutine_threadsafe(_send(), telegram_bot_loop)
-        else:
-            asyncio.run(_send())
-
-    except Exception as e:
-        pass
-
-
-async def send_telegram_message(bot_token, chat_id, message):
-    try:
-        bot = Bot(token=bot_token)
-        await bot.send_message(chat_id=chat_id, text=message)
-    except Exception as e:
-        pass
-
-async def send_telegram_photo(bot_token, chat_id, photo_path, caption=None):
-    try:
-        bot = Bot(token=bot_token)
-        with open(photo_path, 'rb') as photo:
-            await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption)
-    except Exception as e:
-        pass
-
-def is_admin(user_id):
-    with sqlite3.connect(SETTINGS_DB_PATH) as conn:
-        admin = conn.execute(
-            "SELECT 1 FROM admin_users WHERE user_id=?",
-            (str(user_id),)
-        ).fetchone()
-    return admin is not None
-
-def add_admin(user_id, username=None):
-    try:
-        with sqlite3.connect(SETTINGS_DB_PATH) as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO admin_users (user_id, username) VALUES (?, ?)",
-                (str(user_id), username)
-            )
-        return True
-    except Exception as e:
-        return False
-
-def remove_admin(user_id):
-    try:
-        with sqlite3.connect(SETTINGS_DB_PATH) as conn:
-            conn.execute(
-                "DELETE FROM admin_users WHERE user_id=?",
-                (str(user_id),))
-        return True
-    except Exception as e:
-        return False
-
-def list_admins():
-    with sqlite3.connect(SETTINGS_DB_PATH) as conn:
-        admins = conn.execute(
-            "SELECT user_id, username, created_at FROM admin_users ORDER BY created_at DESC"
-        ).fetchall()
-    return admins
-
-# === واجهة المستخدم الرئيسية ===
-def main(page: Page):
-    page.title = "نظام إدارة المنتجات"
-    page.theme_mode = ThemeMode.LIGHT
-    page.vertical_alignment = MainAxisAlignment.START
-    page.horizontal_alignment = CrossAxisAlignment.CENTER
-    page.window.full_screen = True
+# دالة لتحميل الإعدادات من الملف
+def load_config():
+    # إنشاء مجلد assets إذا لم يكن موجوداً
+    assets_dir = os.path.dirname(CONFIG_FILE)
+    if assets_dir and not os.path.exists(assets_dir):
+        os.makedirs(assets_dir)
     
-    # حالة التطبيق
-    selected_products = {}
-    current_view = "products"
-    edit_product_id = None
-    telegram_bot_thread = None
-    telegram_bot_event = None
-    
-    # تعريف أنماط الأزرار
-    button_style = ButtonStyle(
-        shape=RoundedRectangleBorder(radius=8),
-        padding=20,
-        elevation=5,
-    )
-
-    # شريط التنقل
-    def create_nav_rail(selected_index):
-        return NavigationRail(
-            selected_index=selected_index,
-            label_type=NavigationRailLabelType.ALL,
-            min_width=100,
-            min_extended_width=150,
-            destinations=[
-                NavigationRailDestination(
-                    icon=Icons.SHOPPING_BAG_OUTLINED,
-                    selected_icon=Icons.SHOPPING_BAG,
-                    label="المنتجات"
-                ),
-                NavigationRailDestination(
-                    icon=Icons.ADD_CIRCLE_OUTLINE,
-                    selected_icon=Icons.ADD_CIRCLE,
-                    label="إضافة منتج"
-                ),
-                NavigationRailDestination(
-                    icon=Icons.EDIT_OUTLINED,
-                    selected_icon=Icons.EDIT,
-                    label="تعديل المنتجات"
-                ),
-                NavigationRailDestination(
-                    icon=Icons.SETTINGS_OUTLINED,
-                    selected_icon=Icons.SETTINGS,
-                    label="إعدادات البوت"
-                ),
-                NavigationRailDestination(
-                    icon=Icons.ADMIN_PANEL_SETTINGS_OUTLINED,
-                    selected_icon=Icons.ADMIN_PANEL_SETTINGS,
-                    label="إدارة المسؤولين"
-                )
-            ],
-            on_change=lambda e: navigate_to(e.control.selected_index)
-        )
-    
-    # === صفحة المنتجات ===
-    search_field = TextField(
-        label="بحث عن منتج",
-        prefix_icon=Icons.SEARCH,
-        width=300,
-        on_change=lambda e: refresh_products()
-    )
-    
-    products_grid = GridView(
-        runs_count=3,
-        max_extent=350,
-        child_aspect_ratio=0.9,
-        spacing=10,
-        run_spacing=10,
-        expand=True,
-    )
-
-    total_price_banner = Container(
-        content=Row([
-            Text("المجموع:", size=18, weight=FontWeight.BOLD),
-            Text("0", size=18, weight=FontWeight.BOLD, color=Colors.BLUE_700),
-            Text("درهم", size=18, weight=FontWeight.BOLD)
-        ], spacing=5),
-        bgcolor=Colors.BLUE_50,
-        padding=15,
-        border_radius=10,
-        visible=False,
-        width=300,
-        alignment=alignment.center
-    )
-    def show_total(e=None):  # أضفت e=None لجعلها تعمل مع الأحداث
-        if not selected_products:
-            page.snack_bar = SnackBar(
-                content=Text("⚠️ لم يتم اختيار أي منتجات", color=Colors.WHITE),
-                bgcolor=Colors.RED_700,
-                behavior=SnackBarBehavior.FLOATING,
-                elevation=10,
-                shape=RoundedRectangleBorder(radius=10),
-                show_close_icon=True
-            )
-            page.snack_bar.open = True
-            page.update()
-            return
-        
-        # حساب المجموع
-        total = sum(price * qty for price, qty in selected_products.values())
-        
-        # إنشاء محتوى الفاتورة
-        items_list = Column([], spacing=5, scroll=ScrollMode.AUTO)
-        
-        with sqlite3.connect(DB_PATH) as conn:
-            for product_id, (price, qty) in selected_products.items():
-                product = conn.execute(
-                    "SELECT name FROM products WHERE id=?",
-                    (product_id,)
-                ).fetchone()
-                
-                if product:
-                    items_list.controls.append(
-                        Container(
-                            content=Row([
-                                Text(product[0], width=200, size=14),
-                                Text(f"{qty} × {price} درهم", width=100, size=14),
-                                Text(f"{qty * price} درهم", width=100, 
-                                    size=14, weight=FontWeight.BOLD)
-                            ], 
-                            alignment=MainAxisAlignment.SPACE_BETWEEN,
-                            vertical_alignment=CrossAxisAlignment.CENTER),
-                            padding=5
-                        ))
-        
-        # إضافة المجموع الكلي
-        items_list.controls.append(Divider())
-        items_list.controls.append(
-            Container(
-                content=Row([
-                    Text("المجموع الكلي:", size=16, weight=FontWeight.BOLD),
-                    Text(f"{total} درهم", size=16, weight=FontWeight.BOLD,
-                        color=Colors.BLUE_700)
-                ], 
-                alignment=MainAxisAlignment.SPACE_BETWEEN),
-                padding=10
-            )
-        )
-        
-        # إنشاء النافذة المنبثقة
-        dlg = AlertDialog(
-            modal=True,
-            title=Container(
-                content=Text("تفاصيل الفاتورة", 
-                        size=20, 
-                        weight=FontWeight.BOLD,
-                        text_align=TextAlign.CENTER),
-                padding=10
-            ),
-            content=Container(
-                content=Column([
-                    Text("المنتجات المختارة:", 
-                        weight=FontWeight.BOLD,
-                        size=16),
-                    Container(height=10),
-                    items_list
-                ]),
-                width=500,
-                height=300,
-                padding=10
-            ),
-            actions=[
-                TextButton("إغلاق", 
-                        on_click=lambda e: close_dialog(),
-                        style=ButtonStyle(color=Colors.BLUE)),
-                TextButton(
-                    "تأكيد الشراء",
-                    on_click=lambda e: [buy_selected_products(), close_dialog()],
-                    style=ButtonStyle(
-                        color=Colors.WHITE,
-                        bgcolor=Colors.GREEN_600,
-                        padding=20
-                    )
-                )
-            ],
-            actions_alignment=MainAxisAlignment.END,
-            shape=RoundedRectangleBorder(radius=15)
-        )
-        
-        def close_dialog():
-            page.close(dlg)
-
-        
-        page.dialog = dlg
-        page.open(dlg)
-
-    products_page = Column([
-        Row([
-            search_field,
-            ElevatedButton(
-                "حساب المجموع",
-                icon=Icons.CALCULATE,
-                on_click= show_total
-            )
-        ], wrap=False, alignment=MainAxisAlignment.SPACE_BETWEEN),
-        total_price_banner,
-        products_grid
-    ], expand=True)
-
-    # === صفحة إضافة منتج ===
-    product_name = TextField(
-        label="اسم المنتج",
-        width=600,
-        height=70,
-        border_radius=15,
-        border_color=Colors.BLUE_400,
-        focused_border_color=Colors.BLUE_700,
-        text_size=16,
-        content_padding=20,
-        filled=True,
-        bgcolor=Colors.GREY_50
-    )
-
-    product_price = TextField(
-        label="السعر (درهم)",
-        keyboard_type=KeyboardType.NUMBER,
-        width=280,
-        height=70,
-        border_radius=15,
-        border_color=Colors.BLUE_400,
-        focused_border_color=Colors.BLUE_700,
-        text_size=16,
-        content_padding=20,
-        prefix_text="د.م",
-        filled=True,
-        bgcolor=Colors.GREY_50
-    )
-
-    product_quantity = TextField(
-        label="الكمية المتاحة",
-        keyboard_type=KeyboardType.NUMBER,
-        width=280,
-        height=70,
-        border_radius=15,
-        border_color=Colors.BLUE_400,
-        focused_border_color=Colors.BLUE_700,
-        text_size=16,
-        content_padding=20,
-        filled=True,
-        bgcolor=Colors.GREY_50
-    )
-
-    product_image_path = Text(
-        size=14,
-        color=Colors.GREY_600,
-        weight=FontWeight.BOLD
-    )
-
-    product_preview = Container(
-        width=300,
-        height=300,
-        border_radius=15,
-        bgcolor=Colors.GREY_100,
-        alignment=alignment.center,
-        content=Column(
-            [
-                Icon(Icons.IMAGE_OUTLINED, size=80, color=Colors.GREY_400),
-                Text("صورة المنتج", size=16, color=Colors.GREY_500)
-            ],
-            alignment=MainAxisAlignment.CENTER,
-            horizontal_alignment=CrossAxisAlignment.CENTER
-        )
-    )
-
-    def update_preview(e):
-        if file_picker.result and file_picker.result.files:
-            file = file_picker.result.files[0]
-            product_preview.content = Image(
-                src=file.path,
-                width=300,
-                height=300,
-                fit=ImageFit.COVER,
-                border_radius=15
-            )
-            product_image_path.value = file.name
-        else:
-            product_preview.content = Column(
-                [
-                    Icon(Icons.IMAGE_OUTLINED, size=80, color=Colors.GREY_400),
-                    Text("صورة المنتج", size=16, color=Colors.GREY_500)
-                ],
-                alignment=MainAxisAlignment.CENTER,
-                horizontal_alignment=CrossAxisAlignment.CENTER
-            )
-            product_image_path.value = "لم يتم اختيار ملف"
-        page.update()
-
-    file_picker = FilePicker(on_result=update_preview)
-    page.overlay.append(file_picker)
-
-    def save_product(e):
-        if not all([product_name.value, product_price.value, product_quantity.value]):
-            show_snackbar("الرجاء ملء جميع الحقول المطلوبة")
-            return
-        
+    # شوف لو ملف الإعدادات موجود
+    if os.path.exists(CONFIG_FILE):
         try:
-            price = float(product_price.value)
-            quantity = int(product_quantity.value)
-        except ValueError:
-            show_snackbar("القيم المدخلة غير صالحة")
-            return
-        
-        image_path = None
-        if file_picker.result and file_picker.result.files:
-            try:
-                file = file_picker.result.files[0]
-                filename = f"{datetime.now().timestamp()}.jpg"
-                dst = os.path.join(IMAGES_FOLDER, filename)
-                
-                shutil.copy(file.path, dst)
-                resize_image(dst, dst, IMAGE_SIZE)
-                image_path = dst
-            except Exception as e:
+            # افتح الملف واقرأ الإعدادات
+            with open(CONFIG_FILE, "r") as f:
+                config = json.load(f)
+                # تأكد من وجود كل الإعدادات الأساسية
+                for key, value in DEFAULT_CONFIG.items():
+                    if key not in config:
+                        config[key] = value  # أضف الإعداد الناقص
+                return config
+        except:
+            # لو في خطأ ارجع للإعدادات الأساسية
+            return DEFAULT_CONFIG.copy()
+    # لو الملف مش موجود ارجع للإعدادات الأساسية
+    return DEFAULT_CONFIG.copy()
+
+# دالة لحفظ الإعدادات في الملف
+def save_config(cfg):
+    try:
+        # إنشاء مجلد assets إذا لم يكن موجوداً
+        assets_dir = os.path.dirname(CONFIG_FILE)
+        if assets_dir and not os.path.exists(assets_dir):
+            os.makedirs(assets_dir)
             
-                show_snackbar("حدث خطأ أثناء حفظ الصورة")
-        
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "INSERT INTO products (name, price, quantity, image) VALUES (?, ?, ?, ?)",
-                (product_name.value, price, quantity, image_path)
-            )
-        
-        message = f"تمت إضافة منتج جديد:\n{product_name.value}\nالسعر: {price} درهم\nالكمية: {quantity}"
-        send_telegram_notification(message)
-        
-        product_name.value = ""
-        product_price.value = ""
-        product_quantity.value = ""
-        product_image_path.value = ""
-        
-        file_picker._result = None
-        file_picker.update()
-        
-        show_snackbar("تم حفظ المنتج بنجاح")
-        navigate_to(0)
-        page.update()
+        # افتح الملف واكتب الإعدادات
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+        return True  # نجح الحفظ
+    except:
+        return False  # فشل الحفظ
+# دالة لقياس درجة حرارة الجهاز في الويندوز
+def get_temperature_windows():
+    """الحصول على درجة الحرارة في Windows بشكل آمن"""
+    # الطريقة الأولى: استخدام OpenHardwareMonitor
+    try:
+        import wmi
+        w = wmi.WMI(namespace="root\\OpenHardwareMonitor")
+        sensors = w.Sensor()
+        for sensor in sensors:
+            if sensor.SensorType == 'Temperature' and sensor.Value:
+                return float(sensor.Value)
+    except:
+        pass
 
-    add_product_page = Container(
-        padding=40,
-        content=Column(
-            [
-                Container(
-                    content=Text("إضافة منتج جديد", size=28, weight=FontWeight.BOLD, color=Colors.BLUE_700),
-                    padding=padding.only(bottom=30)
-                ),
-                
-                Card(
-                    elevation=15,
-                    shape=RoundedRectangleBorder(radius=20),
-                    content=Container(
-                        padding=40,
-                        bgcolor=Colors.WHITE,
-                        content=Column(
-                            [
-                                Row(
-                                    [
-                                        product_preview,
-                                        Container(width=40),
-                                        Column(
-                                            [
-                                                product_name,
-                                                Container(height=20),
-                                                Row(
-                                                    [
-                                                        product_price,
-                                                        Container(width=20),
-                                                        product_quantity,
-                                                    ],
-                                                    alignment=MainAxisAlignment.START
-                                                ),
-                                                Container(height=20),
-                                                Row(
-                                                    [
-                                                        ElevatedButton(
-                                                            content=Row(
-                                                                [
-                                                                    Icon(Icons.IMAGE, color=Colors.WHITE),
-                                                                    Text("اختر صورة المنتج", color=Colors.WHITE)
-                                                                ],
-                                                                spacing=10
-                                                            ),
-                                                            style=ButtonStyle(
-                                                                shape=RoundedRectangleBorder(radius=10),
-                                                                padding={"left": 30, "right": 30, "top": 15, "bottom": 15},
-                                                                bgcolor=Colors.BLUE_400,
-                                                            ),
-                                                            on_click=lambda _: file_picker.pick_files()
-                                                        ),
-                                                        Container(width=20),
-                                                        product_image_path
-                                                    ],
-                                                    alignment=MainAxisAlignment.START
-                                                )
-                                            ],
-                                            alignment=MainAxisAlignment.CENTER,
-                                            expand=True
-                                        )
-                                    ],
-                                    spacing=20
-                                ),
-                                Container(height=40),
-                                Row(
-                                    [
-                                        ElevatedButton(
-                                            content=Row(
-                                                [
-                                                    Icon(Icons.SAVE, color=Colors.WHITE),
-                                                    Text("حفظ المنتج", color=Colors.WHITE)
-                                                ],
-                                                spacing=15
-                                            ),
-                                            style=ButtonStyle(
-                                                shape=RoundedRectangleBorder(radius=10),
-                                                padding={"left": 50, "right": 50, "top": 20, "bottom": 20},
-                                                bgcolor=Colors.GREEN_600,
-                                            ),
-                                            on_click=save_product
-                                        ),
-                                        Container(width=30),
-                                        ElevatedButton(
-                                            content=Row(
-                                                [
-                                                    Icon(Icons.CANCEL, color=Colors.WHITE),
-                                                    Text("إلغاء", color=Colors.WHITE)
-                                                ],
-                                                spacing=15
-                                            ),
-                                            style=ButtonStyle(
-                                                shape=RoundedRectangleBorder(radius=10),
-                                                padding={"left": 50, "right": 50, "top": 20, "bottom": 20},
-                                                bgcolor=Colors.RED_600,
-                                            ),
-                                            on_click=lambda e: navigate_to(0)
-                                        )
-                                    ],
-                                    alignment=MainAxisAlignment.CENTER
-                                )
-                            ],
-                            horizontal_alignment=CrossAxisAlignment.CENTER
-                        )
-                    )
-                )
-            ],
-            scroll=ScrollMode.AUTO,
-            expand=True
+    # الطريقة الثانية: استخدام PowerShell
+    try:
+        import subprocess
+        # أمر PowerShell لقياس الحرارة
+        result = subprocess.run(
+            ["powershell", "-Command",
+             "Get-WmiObject -Namespace 'root\\WMI' -Class MSAcpi_ThermalZoneTemperature | Select-Object -ExpandProperty CurrentTemperature"],
+            capture_output=True, text=True, timeout=5
         )
-    )
-    
-    # === صفحة تعديل المنتجات ===
-    edit_search_field = TextField(
-        label="بحث عن منتج للتعديل",
-        prefix_icon=Icons.SEARCH,
-        width=300,
-        on_change=lambda e: refresh_edit_products()
-    )
-    
-    edit_products_grid = GridView(
-        runs_count=3,
-        max_extent=350,
-        child_aspect_ratio=0.9,
-        spacing=10,
-        run_spacing=10,
-        expand=True
-    )
-    
-    edit_page = Column([
-        edit_search_field,
-        Container(edit_products_grid, expand=True)
-    ], expand=True)
+        if result.returncode == 0 and result.stdout.strip():
+            temp_raw = float(result.stdout.strip())
+            # تحويل القراءة لدرجة مئوية
+            if temp_raw > 1000:  # لو كانت كبيرة، تحويل من 0.1 كلفن
+                return temp_raw / 10.0 - 273.15
+            else:  # لو كانت صغيرة، غالبًا بالـ 0.1°C
+                return temp_raw / 10.0
+    except:
+        pass
 
-    # === صفحة تعديل منتج فردي ===
-    edit_name = TextField(label="اسم المنتج", width=400)
-    edit_price = TextField(label="السعر", keyboard_type=KeyboardType.NUMBER, width=200)
-    edit_quantity = TextField(label="الكمية المتاحة", keyboard_type=KeyboardType.NUMBER, width=200)
-    edit_sold = TextField(label="عدد المبيعات", keyboard_type=KeyboardType.NUMBER, width=200, read_only=True)
-    edit_image_path = Text()
-    
-    edit_file_picker = FilePicker()
-    page.overlay.append(edit_file_picker)
-    
-    def update_product(e):
-        if not edit_product_id or not all([edit_name.value, edit_price.value, edit_quantity.value]):
-            show_snackbar("الرجاء ملء جميع الحقول المطلوبة")
-            return
+    # الطريقة الثالثة: استخدام WMIC
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["wmic", "path", "Win32_PerfFormattedData_Counters_ThermalZoneInformation", "get", "Temperature"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            lines = result.stdout.strip().split('\n')
+            for line in lines:
+                line = line.strip()
+                if line.isdigit():
+                    temp_raw = float(line)
+                    if temp_raw > 1000:  # كلفن ×10
+                        return temp_raw / 10.0 - 273.15
+                    else:  # مئوي ×10
+                        return temp_raw / 10.0
+    except:
+        pass
+
+    return None  # لو كل الطرق فشلت
+
+# دالة محسنة لقياس درجة الحرارة باستخدام كل الطرق
+def get_reliable_temperature():
+    temps = []  # قائمة لتخزين كل القراءات
+
+    # 1️⃣ الطريقة الأولى: OpenHardwareMonitor
+    try:
+        import wmi
+        w = wmi.WMI(namespace="root\\OpenHardwareMonitor")
+        sensors = w.Sensor()
+        for sensor in sensors:
+            if sensor.SensorType == 'Temperature' and sensor.Value:
+                val = float(sensor.Value)
+                if 0 < val < 120:  # شوف لو القيمة منطقية
+                    temps.append(val)
+    except:
+        pass
+
+    # 2️⃣ الطريقة الثانية: PowerShell MSAcpi
+    try:
+        import subprocess
+        cmd = [
+            "powershell", "-Command",
+            "Get-CimInstance -Namespace root\\WMI -ClassName MSAcpi_ThermalZoneTemperature | Select-Object -ExpandProperty CurrentTemperature"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+        if result.returncode == 0 and result.stdout.strip():
+            for line in result.stdout.strip().splitlines():
+                raw = float(line.strip())
+                if raw > 1000:  # 0.1 K
+                    val = raw / 10.0 - 273.15
+                else:  # 0.1 °C
+                    val = raw / 10.0
+                if 0 < val < 120:
+                    temps.append(val)
+    except:
+        pass
+
+    # 3️⃣ الطريقة الثالثة: WMIC (Windows)
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["wmic", "path", "Win32_PerfFormattedData_Counters_ThermalZoneInformation", "get", "Temperature"],
+            capture_output=True, text=True, timeout=3
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for line in result.stdout.strip().split('\n'):
+                line = line.strip()
+                if line.isdigit():
+                    raw = float(line)
+                    val = (raw / 10.0 - 273.15) if raw > 1000 else raw / 10.0
+                    if 0 < val < 120:
+                        temps.append(val)
+    except:
+        pass
+
+    # 4️⃣ الطريقة الرابعة: psutil (Linux/Mac + Windows حديث)
+    try:
+        import psutil
+        if hasattr(psutil, 'sensors_temperatures'):
+            st = psutil.sensors_temperatures()
+            for entries in st.values():
+                for entry in entries:
+                    if hasattr(entry, 'current') and entry.current and 0 < entry.current < 120:
+                        temps.append(entry.current)
+    except:
+        pass
+
+    # خد أعلى قراءة منطقية
+    if temps:
+        return max(temps)
+    return None  # لو مفيش قراءات
+
+# دالة سريعة لمراقبة كرت الشاشة
+def get_fast_gpu_info():
+    """نسخة سريعة لـ GPU"""
+    try:
+        # جرب استخدام مكتبة GPUtil أولاً
+        if GPUtil:
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                g = gpus[0]
+                return {
+                    "name": g.name,  # اسم كرت الشاشة
+                    "load": round(g.load * 100, 1) if g.load else 0,  # نسبة الاستخدام
+                    "temperature": g.temperature,  # درجة الحرارة
+                    "memory": "N/A"  # الذاكرة
+                }
         
+        # جرب استخدام nvidia-smi لـ NVIDIA
         try:
-            price = float(edit_price.value)
-            quantity = int(edit_quantity.value)
-        except ValueError:
-            show_snackbar("القيم المدخلة غير صالحة")
+            import subprocess
+            result = subprocess.run([
+                "nvidia-smi", 
+                "--query-gpu=name,utilization.gpu,temperature.gpu",
+                "--format=csv,noheader,nounits"
+            ], capture_output=True, text=True, timeout=3)
+            if result.returncode == 0 and result.stdout.strip():
+                data = result.stdout.strip().split(', ')
+                if len(data) >= 3:
+                    return {
+                        "name": data[0],
+                        "load": float(data[1]) if data[1] else 0,
+                        "temperature": float(data[2]) if data[2] else None,
+                        "memory": "N/A"
+                    }
+        except:
+            pass
+            
+    except Exception as e:
+        print(f"Fast GPU info error: {e}")
+    return {"name": "N/A", "load": None, "temperature": None, "memory": "N/A"}
+
+# متغيرات عالمية لتتبع إحصائيات الشبكة
+network_stats = {
+    "prev_bytes_sent": 0,  # آخر عدد بايتات مرسلة
+    "prev_bytes_recv": 0,  # آخر عدد بايتات مستلمة
+    "last_time": time.time(),  # آخر وقت تحديث
+    "sent_speed": 0,  # سرعة الإرسال الحالية
+    "recv_speed": 0   # سرعة الاستقبال الحالية
+}
+
+# دالة لجلب معلومات الشبكة
+def get_network_info():
+    try:
+        addrs = psutil.net_if_addrs()  # عناوين الشبكة
+        stats = psutil.net_if_stats()  # إحصائيات الشبكة
+        net_io = psutil.net_io_counters()  # إحصائيات الإرسال والاستقبال
+        
+        # حساب سرعة الشبكة
+        current_time = time.time()
+        time_diff = current_time - network_stats["last_time"]
+        
+        if time_diff > 0:
+            # حساب الفرق في البايتات المرسلة والمستلمة
+            bytes_sent_diff = net_io.bytes_sent - network_stats["prev_bytes_sent"]
+            bytes_recv_diff = net_io.bytes_recv - network_stats["prev_bytes_recv"]
+            
+            # حساب السرعة بالكيلوبايت في الثانية
+            network_stats["sent_speed"] = bytes_sent_diff / time_diff / 1024
+            network_stats["recv_speed"] = bytes_recv_diff / time_diff / 1024
+            
+            # تحديث القيم السابقة
+            network_stats["prev_bytes_sent"] = net_io.bytes_sent
+            network_stats["prev_bytes_recv"] = net_io.bytes_recv
+            network_stats["last_time"] = current_time
+        
+        # البحث عن واجهة الشبكة النشطة
+        active_interface = None
+        for ifname in addrs:
+            s = stats.get(ifname)
+            if s and s.isup:  # لو الشبكة شغالة
+                for addr in addrs[ifname]:
+                    if addr.family == 2 and not addr.address.startswith("127."):
+                        active_interface = ifname
+                        break
+                if active_interface:
+                    break
+        
+        # تجميع معلومات الشبكة
+        if active_interface:
+            s = stats[active_interface]
+            return {
+                "interface": active_interface,  # اسم واجهة الشبكة
+                "ip": next((addr.address for addr in addrs[active_interface] if addr.family == 2 and not addr.address.startswith("127.")), "N/A"),  # العنوان IP
+                "speed": f"{s.speed}Mbps",  # سرعة الشبكة
+                "status": "Connected",  # حالة الاتصال
+                "upload": network_stats["sent_speed"],  # سرعة الرفع
+                "download": network_stats["recv_speed"]  # سرعة التحميل
+            }
+    except Exception as e:
+        print(f"Network info error: {e}")
+    
+    # لو في خطأ ارجع قيم افتراضية
+    return {
+        "interface": "N/A", 
+        "ip": "N/A", 
+        "speed": "N/A", 
+        "status": "Disconnected",
+        "upload": 0,
+        "download": 0
+    }
+
+# دالة لتنسيق عرض سرعة الشبكة
+def format_speed(speed):
+    if speed >= 1024:
+        return f"{speed/1024:.1f} MB/s"  # ميغابايت في الثانية
+    else:
+        return f"{speed:.1f} KB/s"  # كيلوبايت في الثانية
+
+# دالة لعرض إشعارات النظام
+def show_system_notification(title, message):
+    """إشعارات النظام باستخدام PowerShell فقط"""
+    try:
+        import subprocess
+        # أمر PowerShell لعمل إشعار
+        ps_command = f'''
+        Add-Type -AssemblyName System.Windows.Forms
+        $notification = New-Object System.Windows.Forms.NotifyIcon
+        $notification.Icon = [System.Drawing.SystemIcons]::Information
+        $notification.BalloonTipIcon = "Warning"
+        $notification.BalloonTipTitle = "{title}"
+        $notification.BalloonTipText = "{message}"
+        $notification.Visible = $true
+        $notification.ShowBalloonTip(3000)
+        Start-Sleep -Seconds 3
+        $notification.Dispose()
+        '''
+        subprocess.Popen(["powershell", "-Command", ps_command], shell=False)
+    except Exception as e:
+        print(f"Notification error: {e}")
+
+# كلاس لإدارة الإشعارات في شريط المهام
+class SystemTray:
+    def __init__(self, page):
+        self.page = page  # صفحة البرنامج
+        self.alert_history = []  # قائمة لتخزين تاريخ التنبيهات
+        self.last_alert_time = {}  # لتتبع وقت آخر تنبيه
+
+    # دالة لعرض التنبيهات
+    def show_alert(self, title, message, alert_type="system"):
+        key = f"{title}_{message}"  # مفتاح فريد لكل تنبيه
+        now = time.time()  # الوقت الحالي
+        
+        # منع التكرار - لا تعرض نفس التنبيه قبل 30 ثانية
+        if key in self.last_alert_time and now - self.last_alert_time[key] < 30:
             return
         
-        with sqlite3.connect(DB_PATH) as conn:
-            old_image = conn.execute(
-                "SELECT image FROM products WHERE id=?",
-                (edit_product_id,)
-            ).fetchone()[0]
-            
-            new_image = old_image
-            if edit_file_picker.result and edit_file_picker.result.files:
-                try:
-                    file = edit_file_picker.result.files[0]
-                    filename = f"{datetime.now().timestamp()}.jpg"
-                    dst = os.path.join(IMAGES_FOLDER, filename)
-                    shutil.copy(file.path, dst)
-                    resize_image(dst, dst, IMAGE_SIZE)
-                    new_image = dst
-                    
-                    if old_image and os.path.exists(old_image):
-                        os.remove(old_image)
-                except Exception as e:
-                    
-                    show_snackbar("حدث خطأ أثناء حفظ الصورة الجديدة")
-            
-            conn.execute(
-                "UPDATE products SET name=?, price=?, quantity=?, image=? WHERE id=?",
-                (edit_name.value, price, quantity, new_image, edit_product_id)
-            )
+        # حفظ وقت التنبيه
+        self.last_alert_time[key] = now
+        # إضافة التنبيه للتاريخ
+        self.alert_history.append((title, message, datetime.now().strftime("%H:%M:%S")))
+        # الحفاظ على آخر 50 تنبيه فقط
+        if len(self.alert_history) > 50:
+            self.alert_history.pop(0)
         
-        message = f"تم تحديث المنتج:\n{edit_name.value}\nالسعر الجديد: {price} درهم\nالكمية الجديدة: {quantity}"
-        send_telegram_notification(message)
-        
-        show_snackbar("تم تحديث المنتج بنجاح")
-        navigate_to(2)
+        # عرض إشعار النظام لو مطلوب
+        if alert_type == "system":
+            show_system_notification(title, message)
+
+
+# دالة الرئيسية للبرنامج - كل حاجة بتبدأ من هنا
+def main(page: ft.Page):
+    # تحميل الإعدادات من الملف
+    cfg = load_config()
+    # إنشاء كائن للإشعارات في شريط المهام
+    tray = SystemTray(page)
+
+    # إعدادات النافذة الرئيسية
+    page.title = "System Health Monitor"  # عنوان البرنامج
+    page.window.width = 800  # عرض النافذة
+    page.window.height = 770  # ارتفاع النافذة
+    page.window.resizable = False
+    page.padding = 20  # المسافات الداخلية
+    page.theme_mode = ft.ThemeMode.LIGHT  # الوضع الفاتح
+    page.bgcolor = ft.Colors.GREY_50  # لون خلفية فاتح
+
+    # عناصر الواجهة للنصوص المعروضة
+    cpu_text = ft.Text("--", size=20, weight=ft.FontWeight.BOLD)  # نص عرض استخدام المعالج
+    ram_text = ft.Text("--", size=20, weight=ft.FontWeight.BOLD)  # نص عرض استخدام الذاكرة
+    batt_text = ft.Text("--", size=20, weight=ft.FontWeight.BOLD)  # نص عرض مستوى البطارية
+    temp_text = ft.Text("--", size=20, weight=ft.FontWeight.BOLD)  # نص عرض درجة الحرارة
+    gpu_text = ft.Text("--", size=16, weight=ft.FontWeight.BOLD)  # نص عرض معلومات كرت الشاشة
+    net_text = ft.Text("--", size=16, weight=ft.FontWeight.BOLD)  # نص عرض معلومات الشبكة
+    status_text = ft.Text("🟢 Monitoring Active", size=16, weight=ft.FontWeight.BOLD, color=ft.Colors.GREEN)  # نص حالة المراقبة
     
-    edit_product_page = Container(
-    padding=20,
-    content=Column(
-        [
-            Container(
-                content=Row(
-                    [
-                        Icon(Icons.EDIT, color=Colors.BLUE_700, size=28),
-                        Text("تعديل المنتج", size=28, weight=FontWeight.BOLD, color=Colors.BLUE_700),
-                    ],
-                    alignment=MainAxisAlignment.CENTER,
-                    spacing=10
-                ),
-                padding=padding.only(bottom=30)
-            ),
-            
-            Card(
-                elevation=15,
-                shape=RoundedRectangleBorder(radius=20),
-                content=Container(
-                    padding=30,
-                    content=Column(
-                        [
-                            # صورة المنتج مع زر التغيير
-                            Container(
-                                content=Stack(
-                                    [
-                                        Container(
-                                            content=ElevatedButton(
-                                                "تغيير الصورة",
-                                                icon=Icons.CAMERA_ALT,
-                                                style=ButtonStyle(
-                                                    shape=RoundedRectangleBorder(radius=10),
-                                                    bgcolor=Colors.BLUE_600,
-                                                    color=Colors.WHITE,
-                                                    padding=15
-                                                ),
-                                                on_click=lambda _: edit_file_picker.pick_files(),
-                                            ),
-                                            bottom=10,
-                                            right=10,
-                                            alignment=alignment.bottom_right
-                                        )
-                                    ],
-                                    width=300,
-                                    height=200
-                                ),
-                                alignment=alignment.center,
-                                padding=padding.only(bottom=20)
-                            ),
-                            
-                            # رسالة حالة الصورة
-                            Container(
-                                content=Text(
-                                    edit_image_path.value if edit_image_path.value else "لم يتم اختيار صورة",
-                                    size=12,
-                                    color=Colors.GREY_600,
-                                    text_align=TextAlign.CENTER
-                                ),
-                                padding=padding.only(bottom=20),
-                                visible=edit_image_path.value != ""
-                            ),
-                            
-                            # حقول التعديل
-                            Container(
-                                content=Column(
-                                    [
-                                        TextField(
-                                            label="اسم المنتج",
-                                            value=edit_name.value,
-                                            on_change=lambda e: edit_name.__setattr__('value', e.control.value),
-                                            border_radius=10,
-                                            border_color=Colors.BLUE_400,
-                                            filled=True,
-                                            bgcolor=Colors.GREY_50,
-                                            content_padding=15
-                                        ),
-                                        Container(height=15),
-                                        Row(
-                                            [
-                                                TextField(
-                                                    label="السعر (درهم)",
-                                                    value=edit_price.value,
-                                                    on_change=lambda e: edit_price.__setattr__('value', e.control.value),
-                                                    width=180,
-                                                    border_radius=10,
-                                                    border_color=Colors.BLUE_400,
-                                                    filled=True,
-                                                    bgcolor=Colors.GREY_50,
-                                                    content_padding=15,
-                                                    prefix_text="د.م"
-                                                ),
-                                                TextField(
-                                                    label="الكمية المتاحة",
-                                                    value=edit_quantity.value,
-                                                    on_change=lambda e: edit_quantity.__setattr__('value', e.control.value),
-                                                    width=180,
-                                                    border_radius=10,
-                                                    border_color=Colors.BLUE_400,
-                                                    filled=True,
-                                                    bgcolor=Colors.GREY_50,
-                                                    content_padding=15
-                                                ),
-                                                TextField(
-                                                    label="عدد المبيعات",
-                                                    value=edit_sold.value,
-                                                    read_only=True,
-                                                    width=180,
-                                                    border_radius=10,
-                                                    border_color=Colors.GREY_400,
-                                                    filled=True,
-                                                    bgcolor=Colors.GREY_200,
-                                                    content_padding=15
-                                                )
-                                            ],
-                                            spacing=20,
-                                            alignment=MainAxisAlignment.CENTER
-                                        )
-                                    ]
-                                )
-                            ),
-                            
-                            # أزرار التحكم
-                            Container(
-                                content=Row(
-                                    [
-                                        ElevatedButton(
-                                            content=Row(
-                                                [
-                                                    Icon(Icons.SAVE, color=Colors.WHITE),
-                                                    Text("حفظ التعديلات", color=Colors.WHITE)
-                                                ],
-                                                spacing=10
-                                            ),
-                                            style=ButtonStyle(
-                                                shape=RoundedRectangleBorder(radius=10),
-                                                padding={"left": 30, "right": 30, "top": 15, "bottom": 15},
-                                                bgcolor=Colors.GREEN_600,
-                                                elevation=5
-                                            ),
-                                            on_click=update_product
-                                        ),
-                                        Container(width=20),
-                                        ElevatedButton(
-                                            content=Row(
-                                                [
-                                                    Icon(Icons.ARROW_BACK, color=Colors.WHITE),
-                                                    Text("العودة للقائمة", color=Colors.WHITE)
-                                                ],
-                                                spacing=10
-                                            ),
-                                            style=ButtonStyle(
-                                                shape=RoundedRectangleBorder(radius=10),
-                                                padding={"left": 30, "right": 30, "top": 15, "bottom": 15},
-                                                bgcolor=Colors.BLUE_600,
-                                                elevation=5
-                                            ),
-                                            on_click=lambda e: navigate_to(2)
-                                        )
-                                    ],
-                                    alignment=MainAxisAlignment.CENTER,
-                                    spacing=20
-                                ),
-                                padding=padding.only(top=30)
-                            )
-                        ],
-                        horizontal_alignment=CrossAxisAlignment.CENTER
-                    )
-                )
-            )
-        ],
-        spacing=0,
-        scroll=ScrollMode.AUTO,
-        expand=True
+    # أشرطة التقدم لعرض الاستخدام بشكل مرئي
+    cpu_pb = ft.ProgressBar(width=250, height=20, color=ft.Colors.BLUE_700)  # شريط استخدام المعالج
+    ram_pb = ft.ProgressBar(width=250, height=20, color=ft.Colors.GREEN_700)  # شريط استخدام الذاكرة
+    batt_pb = ft.ProgressBar(width=250, height=20, color=ft.Colors.ORANGE_700)  # شريط مستوى البطارية
+
+    # حالة المراقبة - علشان نقدر نوقفها لما نريد
+    monitor_state = {"running": True}
+
+    # نافذة التنبيهات اللي بتظهر لما يكون في مشكلة
+    alert_dialog = ft.AlertDialog(
+        modal=True,  # لازم تغلقها عشان تكمل
+        title=ft.Text("System Alert"),  # عنوان التنبيه
+        content=ft.Text(""),  # محتوى التنبيه (بيتحدد حسب المشكلة)
+        actions=[ft.TextButton("OK", on_click=lambda e: page.close(alert_dialog))]  # زر الإقرار
     )
-)
-    
-    # === صفحة إعدادات البوت ===
-    def create_bot_settings_page():
-        bot_token_field = TextField(
-            label="توكن البوت",
-            width=600,
-            height=70,
-            border_radius=15,
-            border_color=Colors.BLUE_400,
-            focused_border_color=Colors.BLUE_700,
-            text_size=16,
-            content_padding=20,
-            filled=True,
-            bgcolor=Colors.GREY_50,
-            password=True,
-            can_reveal_password=True
-        )
 
-        chat_id_field = TextField(
-            label="معرف المحادثة (Chat ID)",
-            width=600,
-            height=70,
-            border_radius=15,
-            border_color=Colors.BLUE_400,
-            focused_border_color=Colors.BLUE_700,
-            text_size=16,
-            content_padding=20,
-            filled=True,
-            bgcolor=Colors.GREY_50
-        )
+    # دالة لعرض نافذة التنبيه
+    def show_alert_dialog(title, msg):
+        alert_dialog.title = ft.Text(title, weight=ft.FontWeight.BOLD, color=ft.Colors.RED)  # عنوان التنبيه باللون الأحمر
+        alert_dialog.content = ft.Text(msg, size=16)  # رسالة التنبيه
+        page.open(alert_dialog)  # افتح النافذة
 
-        def load_bot_settings():
-            with sqlite3.connect(SETTINGS_DB_PATH) as conn:
-                settings = conn.execute(
-                    "SELECT bot_token, chat_id FROM telegram_bot ORDER BY id DESC LIMIT 1"
-                ).fetchone()
-                
-                if settings:
-                    bot_token_field.value = settings[0]
-                    chat_id_field.value = settings[1]
-                    page.update()
-
-        load_bot_settings()
-
-        def save_settings(e):
-            if not bot_token_field.value or not chat_id_field.value:
-                show_snackbar("الرجاء إدخال التوكن ورقم الشات")
-                return
-            
-            try:
-                with sqlite3.connect(SETTINGS_DB_PATH) as conn:
-                    conn.execute("DELETE FROM telegram_bot")
-                    conn.execute(
-                        "INSERT INTO telegram_bot (bot_token, chat_id) VALUES (?, ?)",
-                        (bot_token_field.value, chat_id_field.value)
-                    )
-                show_snackbar("تم حفظ الإعدادات بنجاح")
-                restart_telegram_bot()
-            except Exception as e:
-                show_snackbar(f"خطأ في الحفظ: {str(e)}")
-
-        def test_connection(e):
-            if not bot_token_field.value or not chat_id_field.value:
-                show_snackbar("الرجاء إدخال التوكن ورقم الشات أولاً")
-                return
-            
-            try:
-                bot = Bot(token=bot_token_field.value)
-                asyncio.run(bot.send_message(
-                    chat_id=chat_id_field.value,
-                    text="✅ تم الاتصال بنجاح من نظام إدارة المنتجات"
-                ))
-                show_snackbar("تم اختبار الاتصال بنجاح")
-            except Exception as e:
-                show_snackbar(f"فشل الاتصال: {str(e)}")
-
-        def delete_settings(e):
-            def confirm_delete(e):
-                try:
-                    with sqlite3.connect(SETTINGS_DB_PATH) as conn:
-                        conn.execute("DELETE FROM telegram_bot")
-                    bot_token_field.value = ""
-                    chat_id_field.value = ""
-                    page.update()
-                    show_snackbar("تم حذف الإعدادات")
-                    stop_telegram_bot()
-                    page.close(dlg)
-                except Exception as e:
-                    show_snackbar(f"خطأ في الحذف: {str(e)}")
-            
-            dlg = AlertDialog(
-                title=Text("تأكيد الحذف"),
-                content=Text("هل أنت متأكد من حذف إعدادات البوت؟"),
-                actions=[
-                    TextButton("نعم", on_click=confirm_delete),
-                    TextButton("لا", on_click=lambda e: page.close(dlg)),
-                ]
-            )
-            page.dialog = dlg
-            dlg.open = True
-            page.update()
-
-        return Container(
-            padding=40,
-            content=Column(
-                [
-                    Text("إعدادات بوت Telegram", size=28, weight=FontWeight.BOLD, color=Colors.BLUE_700),
-                    Card(
-                        elevation=15,
-                        content=Container(
-                            padding=30,
-                            content=Column(
-                                [
-                                    bot_token_field,
-                                    chat_id_field,
-                                    Row(
-                                        [
-                                            ElevatedButton(
-                                                "حفظ الإعدادات",
-                                                icon=Icons.SAVE,
-                                                on_click=save_settings,
-                                                style=ButtonStyle(
-                                                    bgcolor=Colors.GREEN_600,
-                                                    color=Colors.WHITE,
-                                                    padding=20
-                                                )
-                                            ),
-                                            ElevatedButton(
-                                                "اختبار الاتصال",
-                                                icon=Icons.GRID_ON,
-                                                on_click=test_connection,
-                                                style=ButtonStyle(
-                                                    bgcolor=Colors.BLUE_600,
-                                                    color=Colors.WHITE,
-                                                    padding=20
-                                                )
-                                            ),
-                                            ElevatedButton(
-                                                "حذف الإعدادات",
-                                                icon=Icons.DELETE,
-                                                on_click=delete_settings,
-                                                style=ButtonStyle(
-                                                    bgcolor=Colors.RED_600,
-                                                    color=Colors.WHITE,
-                                                    padding=20
-                                                )
-                                            )
-                                        ],
-                                        spacing=20,
-                                        alignment=MainAxisAlignment.CENTER
-                                    ),
-                                    Container(height=20),
-                                    Divider(),
-                                    Container(
-                                        Text("تعليمات:", size=18, weight=FontWeight.BOLD),
-                                        padding=padding.only(bottom=10)
-                                    ),
-                                    Text("1. احصل على توكن البوت من @BotFather", size=14),
-                                    Text("2. احصل على Chat ID من @userinfobot", size=14)
-                                ],
-                                spacing=20,
-                                horizontal_alignment=CrossAxisAlignment.CENTER
-                            )
-                        )
-                    )
-                ],
-                spacing=30,
-                horizontal_alignment=CrossAxisAlignment.CENTER,
-                scroll=ScrollMode.AUTO
+    # دالة لإنشاء كروت العرض (البطاقات اللي فيها المعلومات)
+    def create_metric_card(title, value_widget, pb_widget=None, color=ft.Colors.BLUE, icon=ft.Icons.MONITOR):
+        # محتوى البطاقة: أيقونة + عنوان + قيمة + شريط تقدم (لو موجود)
+        content = [
+            ft.Row([ft.Icon(icon, size=24, color=color), ft.Text(title, size=16, weight=ft.FontWeight.BOLD, color=color)]),  # الصف العلوي (أيقونة وعنوان)
+            value_widget,  # القيمة (النص)
+        ]
+        if pb_widget:  # لو فيه شريط تقدم أضفه
+            content.append(pb_widget)
+        return ft.Card(  # إرجاع البطاقة كاملة
+            elevation=8,  # ظل للبطاقة
+            content=ft.Container(
+                ft.Column(content, spacing=10, horizontal_alignment=ft.CrossAxisAlignment.CENTER),  # محتوى عمودي
+                padding=20, width=280, border_radius=12  # إعدادات الحاوية
             )
         )
 
-    # === صفحة إدارة المسؤولين المحدثة ===
-    def create_admin_management_page():
-        # حقول الإدخال
-        admin_user_id = TextField(
-            label="معرف المستخدم (User ID)",
-            width=400,
-            height=70,
-            border_radius=15,
-            border_color=Colors.BLUE_400,
-            focused_border_color=Colors.BLUE_700,
-            text_size=16,
-            content_padding=20,
-            filled=True,
-            bgcolor=Colors.GREY_50,
-            hint_text="مثال: 123456789"
-        )
+    # دالة للتحقق من وجود مشاكل وتنبيه المستخدم
+    def check_alerts(cpu, ram, batt, temp, gpu_load):
+        if not cfg.get("show_alerts", True):  # لو التنبيهات متعطلة اخرج
+            return
 
-        admin_username = TextField(
-            label="اسم المستخدم (اختياري)",
-            width=400,
-            height=70,
-            border_radius=15,
-            border_color=Colors.BLUE_400,
-            focused_border_color=Colors.BLUE_700,
-            text_size=16,
-            content_padding=20,
-            filled=True,
-            bgcolor=Colors.GREY_50,
-            hint_text="مثال: @username"
-        )
+        # تنبيه استخدام المعالج العالي
+        if cpu >= cfg["cpu_alert"]:
+            msg = f"CPU usage is high ({cpu:.1f}%)"  # رسالة التنبيه
+            if cfg.get("system_notifications", True):  # لو الإشعارات مفعلة
+                tray.show_alert("🚨 CPU Alert", msg, "system")  # إشعار في شريط المهام
+            show_alert_dialog("CPU Alert", msg)  # نافذة تنبيه
 
-        # عناصر واجهة المستخدم
-        admins_list = ListView(expand=True)
-        search_field = TextField(
-            label="بحث عن مسؤول",
-            prefix_icon=Icons.SEARCH,
-            width=400,
-            on_change=lambda e: refresh_admins_list(),
-            hint_text="ابحث بالاسم أو المعرف"
-        )
+        # تنبيه استخدام الذاكرة العالي
+        if ram >= cfg["ram_alert"]:
+            msg = f"RAM usage is high ({ram:.1f}%)"
+            if cfg.get("system_notifications", True):
+                tray.show_alert("🚨 RAM Alert", msg, "system")
+            show_alert_dialog("RAM Alert", msg)
 
-        # إحصائيات المسؤولين
-        stats_row = Row([
-            Text("عدد المسؤولين: 0", size=16, weight=FontWeight.BOLD),
-            Container(width=20),
-            Text("آخر إضافة: -", size=16, weight=FontWeight.BOLD)
-        ], alignment=MainAxisAlignment.CENTER)
+        # تنبيه البطارية المنخفضة
+        if batt and batt <= cfg["battery_alert"]:
+            msg = f"Battery is low ({batt:.0f}%) - Consider charging"  # نصيحة بالشحن
+            if cfg.get("system_notifications", True):
+                tray.show_alert("🔋 Battery Alert", msg, "system")
+            show_alert_dialog("Battery Alert", msg)
 
-        def refresh_admins_list(search_term=None):
-            admins_list.controls.clear()
-            admins = list_admins()
+        # تنبيه درجة الحرارة العالية
+        if temp and temp >= cfg["temp_alert"]:
+            msg = f"Temperature is high ({temp:.1f}°C) - System may throttle"  # تحذير من بطء النظام
+            if cfg.get("system_notifications", True):
+                tray.show_alert("🌡️ Temperature Alert", msg, "system")
+            show_alert_dialog("Temperature Alert", msg)
+
+        # تنبيف استخدام كرت الشاشة العالي
+        if gpu_load and gpu_load >= 90:  # قيمة ثابتة لكرت الشاشة
+            msg = f"GPU load is high ({gpu_load:.1f}%)"
+            if cfg.get("system_notifications", True):
+                tray.show_alert("🎮 GPU Alert", msg, "system")
+            show_alert_dialog("GPU Alert", msg)
+
+    # دالة لتحديث واجهة المستخدم بالبيانات الجديدة
+    def update_ui(cpu, ram, batt_percent, temp, gpu, net):
+        try:
+            # تحديث بيانات المعالج
+            cpu_text.value = f"{cpu:.1f}%"  # النص
+            cpu_pb.value = cpu / 100  # شريط التقدم (من 0 إلى 1)
             
-            # تحديث الإحصائيات
-            stats_row.controls[0].value = f"عدد المسؤولين: {len(admins)}"
-            if admins:
-                last_added = admins[0]  # أول عنصر هو الأحدث بسبب الترتيب في SQL
-                stats_row.controls[2].value = f"آخر إضافة: {last_added[1] if last_added[1] else last_added[0]}"
+            # تحديث بيانات الذاكرة
+            ram_text.value = f"{ram:.1f}%"
+            ram_pb.value = ram / 100
             
-            if not admins:
-                admins_list.controls.append(
-                    ListTile(
-                        title=Text("لا يوجد مسؤولين مسجلين", 
-                                color=Colors.GREY_500,
-                                text_align=TextAlign.CENTER),
-                        leading=Icon(Icons.WARNING, color=Colors.ORANGE)
-                    )
-                )
+            # تحديث بيانات البطارية
+            batt_text.value = f"{batt_percent:.0f}%" if batt_percent else "N/A"  # لو مفيش بطارية
+            batt_pb.value = (batt_percent or 0) / 100
+            
+            # تحديث بيانات درجة الحرارة
+            if temp:
+                temp_text.value = f"{temp:.1f}°C"
+                temp_text.color = ft.Colors.RED_700  # لون أحمر للتحذير
             else:
-                for user_id, username, created_at in admins:
-                    # فلترة البحث إذا وجد
-                    if search_term and (search_term.lower() not in (username or "").lower() and 
-                                    search_term not in user_id):
-                        continue
-                        
-                    admins_list.controls.append(
-                        Card(
-                            elevation=2,
-                            content=Container(
-                                padding=10,
-                                content=Column([
-                                    ListTile(
-                                        leading=CircleAvatar(
-                                            content=Text(username[0].upper() if username else "?", 
-                                                    color=Colors.WHITE),
-                                            bgcolor=Colors.BLUE_400
-                                        ),
-                                        title=Text(username if username else f"المسؤول {user_id}"),
-                                        subtitle=Column([
-                                            Text(f"معرف المستخدم: {user_id}"),
-                                            Text(f"تمت الإضافة: {created_at}", 
-                                                size=12, 
-                                                color=Colors.GREY)
-                                        ], spacing=0),
-                                        trailing=PopupMenuButton(
-                                            icon=Icon(Icons.MORE_VERT),
-                                            items=[
-                                                PopupMenuItem(
-                                                    content=Text("حذف المسؤول"),
-                                                    on_click=lambda e, uid=user_id: remove_admin_action(uid),
-                                                ),
-                                                PopupMenuItem(
-                                                    content=Text("نسخ المعرف"),
-                                                    on_click=lambda e, uid=user_id: copy_to_clipboard(uid),
-                                                )
-                                            ]
-                                        )
-                                    ),
-                                    Divider(height=1)
-                                ], spacing=0)
-                            )
-                        )
-                    )
-            page.update()
-
-        def copy_to_clipboard(text):
-            page.set_clipboard(text)
-            show_snackbar(f"تم نسخ المعرف: {text}")
-
-        def add_admin_action(e):
-            if not admin_user_id.value:
-                show_snackbar("الرجاء إدخال معرف المستخدم")
-                return
+                temp_text.value = "Not Available"  # لو مفيش قياس
+                temp_text.color = ft.Colors.GREY_500  # لون رمادي
             
-            if not admin_user_id.value.isdigit():
-                show_snackbar("معرف المستخدم يجب أن يكون رقماً")
-                return
+            # تحديث بيانات كرت الشاشة
+            gpu_name = gpu.get('name', 'N/A')  # اسم كرت الشاشة
+            gpu_load = gpu.get('load')  # نسبة الاستخدام
+            gpu_temp = gpu.get('temperature')  # درجة الحرارة
             
+            gpu_display = f"{gpu_name}\n"  # بناء النص المعروض
+            if gpu_load is not None:
+                gpu_display += f"Load: {gpu_load}%\n"
+            else:
+                gpu_display += "Load: N/A\n"
+                
+            if gpu_temp:
+                gpu_display += f"Temp: {gpu_temp}°C"
+            else:
+                gpu_display += "Temp: N/A"
+                
+            gpu_text.value = gpu_display  # تعيين النص النهائي
+            
+            # تحديث بيانات الشبكة
+            if net.get('status') == 'Connected':  # لو متصل بالشبكة
+                net_info = f"{net.get('interface', 'N/A')}\n"  # واجهة الشبكة
+                net_info += f"IP: {net.get('ip', 'N/A')}\n"  # العنوان
+                net_info += f"▲ {format_speed(net.get('upload', 0))}\n"  # سرعة الرفع
+                net_info += f"▼ {format_speed(net.get('download', 0))}"  # سرعة التحميل
+            else:
+                net_info = "Disconnected"  # غير متصل
+            net_text.value = net_info
+            
+            # تحديث حالة المراقبة
+            status_text.value = "🟢 Monitoring Active"
+            status_text.color = ft.Colors.GREEN
+            
+            page.update()  # حدث الواجهة
+        except Exception as e:
+            print(f"UI update error: {e}")  # طباعة الخطأ لو حصل
+
+    # الدالة الرئيسية للمراقبة - بتشتغل في الخلفية
+    def monitor_loop():
+        while monitor_state["running"]:  # استمر طالما المراقبة شغالة
             try:
-                success = add_admin(admin_user_id.value, admin_username.value)
-                if success:
-                    show_snackbar("تمت إضافة المسؤول بنجاح")
-                    admin_user_id.value = ""
-                    admin_username.value = ""
-                    refresh_admins_list()
-                else:
-                    show_snackbar("حدث خطأ أثناء إضافة المسؤول")
-            except Exception as ex:
-                show_snackbar(f"حدث خطأ: {str(ex)}")
+                # جمع البيانات من النظام
+                cpu = psutil.cpu_percent(interval=0.1)  # استخدام المعالج (أسرع قياس)
+                ram = psutil.virtual_memory().percent  # استخدام الذاكرة
+                
+                battery = psutil.sensors_battery()  # معلومات البطارية
+                batt_percent = battery.percent if battery else None  # نسبة الشحن
+                
+                # الحصول على البيانات الأخرى
+                temp = get_reliable_temperature()  # درجة الحرارة
+                gpu = get_fast_gpu_info() if cfg.get("enable_gpu", True) else {}  # كرت الشاشة (لو مفعل)
+                net = get_network_info() if cfg.get("enable_wifi", True) else {}  # الشبكة (لو مفعلة)
 
-        def remove_admin_action(user_id):
-            def confirm_remove(e):
+                # تحديث الواجهة بالبيانات الجديدة
+                update_ui(cpu, ram, batt_percent, temp, gpu, net)
+                # التحقق من المشاكل وإظهار التنبيهات
+                check_alerts(cpu, ram, batt_percent, temp, gpu.get("load"))
+                
+                # الانتظار قبل القياس التالي حسب الإعدادات
+                time.sleep(cfg.get("poll_interval", 0.5))
+                
+            except Exception as e:
+                print(f"Monitoring error: {e}")  # طباعة الخطأ
                 try:
-                    success = remove_admin(user_id)
-                    if success:
-                        show_snackbar("تمت إزالة المسؤول بنجاح")
-                        refresh_admins_list()
-                    else:
-                        show_snackbar("حدث خطأ أثناء إزالة المسؤول")
-                    page.close(dlg)
-                except Exception as ex:
-                    show_snackbar(f"حدث خطأ: {str(ex)}")
-                    page.close(dlg)
-            
-            dlg = AlertDialog(
-                modal=True,
-                title=Row([
-                    Icon(Icons.WARNING, color=Colors.ORANGE),
-                    Container(width=10),
-                    Text("تأكيد الإزالة")
-                ]),
-                content=Column([
-                    Text(f"هل أنت متأكد من إزالة صلاحيات المسؤول؟", size=16),
-                    Container(height=10),
-                    Text(f"معرف المستخدم: {user_id}", 
-                        size=14, 
-                        weight=FontWeight.BOLD,
-                        color=Colors.BLUE_700)
-                ], tight=True),
-                actions=[
-                    TextButton("إلغاء", on_click=lambda e: page.close(dlg)),
-                    TextButton(
-                        "تأكيد الحذف",
-                        on_click=confirm_remove,
-                        style=ButtonStyle(color=Colors.RED)
-                    ),
-                ],
-                actions_alignment=MainAxisAlignment.END,
-            )
-            page.dialog = dlg
-            page.open(dlg)
+                    # تحديث حالة المراقبة لخطأ
+                    status_text.value = "🔴 Monitoring Error"
+                    status_text.color = ft.Colors.RED
+                    page.update()
+                except:
+                    pass
+                time.sleep(1)  # انتظر ثانية قبل المحاولة again
 
+    # إنشاء كروت العرض للمقاييس المختلفة
+    cpu_card = create_metric_card("CPU Usage", cpu_text, cpu_pb, ft.Colors.BLUE_700, ft.Icons.SPEED)  # بطاقة المعالج
+    ram_card = create_metric_card("RAM Usage", ram_text, ram_pb, ft.Colors.GREEN_700, ft.Icons.MEMORY)  # بطاقة الذاكرة
+    batt_card = create_metric_card("Battery", batt_text, batt_pb, ft.Colors.ORANGE_700, ft.Icons.BATTERY_CHARGING_FULL)  # بطاقة البطارية
+    temp_card = create_metric_card("Temperature", temp_text, None, ft.Colors.RED_700, ft.Icons.THERMOSTAT)  # بطاقة الحرارة
+    gpu_card = create_metric_card("GPU", gpu_text, None, ft.Colors.PURPLE_700, ft.Icons.GAMEPAD)  # بطاقة كرت الشاشة
+    net_card = create_metric_card("Network", net_text, None, ft.Colors.TEAL_700, ft.Icons.WIFI)  # بطاقة الشبكة
 
-        # تحميل البيانات الأولية
-        refresh_admins_list()
-
-        return Container(
-            expand=True,
-            padding=20,
-            alignment=alignment.center,
-            content=Column(
-                [
-                    # العنوان والبحث
-                    Row([
-                        Text("إدارة المسؤولين", 
-                            size=28, 
-                            weight=FontWeight.BOLD, 
-                            color=Colors.BLUE_700),
-                        Container(width=20),
-                        search_field
-                    ], alignment=MainAxisAlignment.START),
-                    
-                    Container(height=20),
-                    
-                    # إحصائيات
-                    stats_row,
-                    
-                    Container(height=20),
-                    Divider(),
-                    Container(height=10),
-                    
-                    # نموذج إضافة مسؤول
-                    Card(
-                        elevation=5,
-                        content=Container(
-                            padding=20,
-                            content=Column([
-                                Text("إضافة مسؤول جديد", 
-                                    size=20, 
-                                    weight=FontWeight.BOLD),
-                                Container(height=10),
-                                Row([
-                                    admin_user_id,
-                                    Container(width=20),
-                                    admin_username
-                                ]),
-                                Container(height=20),
-                                ElevatedButton(
-                                    "إضافة مسؤول",
-                                    icon=Icons.PERSON_ADD,
-                                    on_click=add_admin_action,
-                                    style=ButtonStyle(
-                                        bgcolor=Colors.GREEN_600,
-                                        color=Colors.WHITE,
-                                        padding=20
-                                    )
-                                )
-                            ], horizontal_alignment=CrossAxisAlignment.CENTER)
-                        )
-                    ),
-                    
-                    Container(height=20),
-                    
-                    # قائمة المسؤولين
-                    Text("قائمة المسؤولين الحاليين", 
-                        size=20, 
-                        weight=FontWeight.BOLD),
-                    Container(height=10),
-                    
-                    Container(
-                        content=admins_list,
-                        height=400,
-                        border=border.all(1, Colors.GREY_300),
-                        border_radius=10,
-                        padding=10
-                    ),
-                    
-                    # تعليمات
-                    ExpansionTile(
-                        title=Text("تعليمات", weight=FontWeight.BOLD),
-                        controls=[
-                            ListTile(title=Text("- يمكن للمسؤولين إدارة المنتجات عبر التطبيق والبوت")),
-                            ListTile(title=Text("- للحصول على User ID، أرسل /id للبوت")),
-                            ListTile(title=Text("- يمكن البحث عن مسؤول بالاسم أو المعرف")),
-                            ListTile(title=Text("- انقر على أيقونة ⋮ بجوار المسؤول لمزيد من الخيارات"))
-                        ]
-                    )
-                ],
-                scroll=ScrollMode.AUTO,
-                horizontal_alignment=CrossAxisAlignment.CENTER,
-                alignment=MainAxisAlignment.START,
-                spacing=20
-            )
-        )
-
-
-    # === الوظائف الرئيسية ===
-    def refresh_products():
-        products_grid.controls.clear()
-        search_term = search_field.value.lower()
-        with sqlite3.connect(DB_PATH) as conn:
-            products = conn.execute(
-                "SELECT id, name, price, quantity, sold, image FROM products"
-            ).fetchall()
-            
-            for product in products:
-                pid, name, price, quantity, sold, image = product
-                
-                if search_term and search_term not in name.lower():
-                    continue
-                
-                # إضافة تحذير إذا كانت الكمية منخفضة
-                quantity_warning = None
-                if quantity <= 0:
-                    quantity_warning = Row([
-                        Icon(Icons.WARNING, color=Colors.RED, size=16),
-                        Text("إنتهى المنتج", color=Colors.RED, size=12)
-                    ], spacing=5)
-                elif quantity <= 5:
-                    quantity_warning = Row([
-                        Icon(Icons.WARNING, color=Colors.ORANGE, size=16),
-                        Text(f"كمية قليلة ({quantity})", color=Colors.ORANGE, size=12)
-                    ], spacing=5)
-                
-                quantity_field = TextField(
-                    value="1",
-                    width=60,
-                    keyboard_type=KeyboardType.NUMBER,
-                    on_change=lambda e, pid=pid: update_quantity(pid, e.control.value)
-                )
-                
-                def create_buy_callback(product_id, product_name):
-                    def callback(e):
-                        buy_product(product_id, product_name)
-                    return callback
-                
-                def create_select_callback(product_id, product_price):
-                    def callback(e):
-                        try:
-                            qty = int(quantity_field.value) if quantity_field.value.isdigit() else 1
-                            if e.control.value:
-                                selected_products[product_id] = (product_price, qty)
-                            else:
-                                selected_products.pop(product_id, None)
-                            update_total_banner()
-                        except Exception as ex:
-                            pass
-                    return callback
-                
-                product_card = Card(
-                    content=Container(
-                        content=Column([
-                            Image(
-                                src=image if image else "default_product.png",
-                                width=200,
-                                height=150,
-                                fit=ImageFit.CONTAIN
-                            ),
-                            Text(name, size=16, weight=FontWeight.BOLD),
-                            Text(f"السعر: {price} درهم", size=14),
-                            Text(f"المتاح: {quantity} | المباع: {sold}", size=14),
-                            Container(
-                                content=Row([
-                                    Container(
-                                        content=quantity_field,
-                                        width=80,
-                                        padding=padding.only(right=10),
-                                        border_radius=5,
-                                        bgcolor=Colors.GREY_100,
-                                    ),
-                                    ElevatedButton(
-                                        "شراء",
-                                        icon=Icons.SHOPPING_CART,
-                                        on_click=create_buy_callback(pid, name),
-                                        style=ButtonStyle(
-                                            shape=RoundedRectangleBorder(radius=5),
-                                            padding=20,
-                                            bgcolor=Colors.BLUE_400,
-                                            color=Colors.WHITE
-                                        ),
-                                        height=40
-                                    ),
-                                    Container(
-                                        content=Checkbox(
-                                            label="اختر",
-                                            on_change=create_select_callback(pid, price),
-                                            fill_color=Colors.BLUE_400
-                                        ),
-                                        padding=padding.only(left=10)
-                                    )
-                                ], 
-                                alignment=MainAxisAlignment.SPACE_BETWEEN,
-                                vertical_alignment=CrossAxisAlignment.CENTER),
-                                padding=padding.symmetric(vertical=5),
-                                bgcolor=Colors.GREY_50,
-                                border_radius=5,
-                                width=280
-                            )
-                        ], 
-                        spacing=10, 
-                        horizontal_alignment=CrossAxisAlignment.CENTER),
-                        padding=15,
-                        width=320,
-                        height=350
-                    ),
-                    elevation=5,
-                    width=320,
-                    height=350,
-                    shape=RoundedRectangleBorder(radius=10)
-                )
-                
-                products_grid.controls.append(product_card)
-        
-        page.update()
-    
-    def update_quantity(product_id, value):
-        try:
-            quantity = int(value) if value else 1
-            if product_id in selected_products:
-                price = selected_products[product_id][0]
-                selected_products[product_id] = (price, quantity)
-                update_total_banner()
-        except ValueError:
-            pass
-    
-    def refresh_edit_products():
-        edit_products_grid.controls.clear()
-        search_term = edit_search_field.value.lower()
-        
-        with sqlite3.connect(DB_PATH) as conn:
-            products = conn.execute(
-                "SELECT id, name, price, quantity, sold, image FROM products"
-            ).fetchall()
-            
-            for product in products:
-                pid, name, price, quantity, sold, image = product
-                
-                if search_term and search_term not in name.lower():
-                    continue
-                
-                def create_edit_callback(product_id):
-                    def callback(e):
-                        load_product_for_edit(product_id)
-                    return callback
-                
-                def create_delete_callback(product_id, product_name):
-                    def callback(e):
-                        delete_product(product_id, product_name)
-                    return callback
-                
-                product_card = Card(
-                    content=Container(
-                        content=Column([
-                            Image(
-                                src=image if image else "default_product.png",
-                                width=200,
-                                height=150,
-                                fit=ImageFit.CONTAIN
-                            ),
-                            Text(name, size=16, weight=FontWeight.BOLD),
-                            Text(f"السعر: {price} درهم", size=14),
-                            Text(f"المتاح: {quantity} | المباع: {sold}", size=14),
-                            Container(
-                                content=Row([
-                                    ElevatedButton(
-                                        "تعديل",
-                                        icon=Icons.EDIT,
-                                        on_click=create_edit_callback(pid),
-                                        style=ButtonStyle(
-                                            shape=RoundedRectangleBorder(radius=5),
-                                            padding=20,
-                                            bgcolor=Colors.BLUE_400,
-                                            color=Colors.WHITE
-                                        ),
-                                        height=40
-                                    ),
-                                    ElevatedButton(
-                                        "حذف",
-                                        icon=Icons.DELETE,
-                                        on_click=create_delete_callback(pid, name),
-                                        style=ButtonStyle(
-                                            shape=RoundedRectangleBorder(radius=5),
-                                            padding=20,
-                                            bgcolor=Colors.RED_400,
-                                            color=Colors.WHITE
-                                        ),
-                                        height=40
-                                    )
-                                ],
-                                alignment=MainAxisAlignment.SPACE_EVENLY,
-                                spacing=10),
-                                padding=padding.symmetric(vertical=10),
-                                width=280
-                            )
-                        ],
-                        spacing=10,
-                        horizontal_alignment=CrossAxisAlignment.CENTER),
-                        padding=15,
-                        width=320,
-                        height=350
-                    ),
-                    elevation=5,
-                    width=320,
-                    height=350,
-                    shape=RoundedRectangleBorder(radius=10))
-                
-                edit_products_grid.controls.append(product_card)
-        
-        page.update()
-    
-    def load_product_for_edit(product_id):
-        nonlocal edit_product_id, current_view
-        edit_product_id = product_id
-        
-        with sqlite3.connect(DB_PATH) as conn:
-            product = conn.execute(
-                "SELECT name, price, quantity, sold, image FROM products WHERE id=?",
-                (product_id,)
-            ).fetchone()
-            
-            if product:
-                name, price, quantity, sold, image = product
-                edit_name.value = name
-                edit_price.value = str(price)
-                edit_quantity.value = str(quantity)
-                edit_sold.value = str(sold)
-                edit_image_path.value = image if image else "لا توجد صورة"
-                
-                if image:
-                    edit_preview = Image(
-                        src=image,
-                        width=300,
-                        height=300,
-                        fit=ImageFit.COVER,
-                        border_radius=15
-                    )
-                else:
-                    edit_preview = Column(
-                        [
-                            Icon(Icons.IMAGE_OUTLINED, size=80, color=Colors.GREY_400),
-                            Text("صورة المنتج", size=16, color=Colors.GREY_500)
-                        ],
-                        alignment=MainAxisAlignment.CENTER,
-                        horizontal_alignment=CrossAxisAlignment.CENTER
-                    )
-                
-                current_view = "edit_product"
-                page.clean()
-                page.add(
-                    Row(
-                        [
-                            create_nav_rail(2),
-                            VerticalDivider(width=1),
-                            Container(
-                                content=edit_product_page,
-                                expand=True,
-                                padding=20
-                            )
-                        ],
-                        expand=True
-                    )
-                )
-                page.update()
-
-    def delete_product(product_id, product_name):
-        def confirm_delete(e):
-            try:
-                # 1. الحصول على معلومات الصورة أولاً
-                with sqlite3.connect(DB_PATH) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT image FROM products WHERE id=?", (product_id,))
-                    image_data = cursor.fetchone()
-                    
-                    if not image_data:
-                        show_snackbar("المنتج غير موجود!")
-                        page.close(dlg)
-                        return
-
-                    image_path = image_data[0]
-                    
-                    # 2. حذف المنتج من قاعدة البيانات
-                    cursor.execute("DELETE FROM products WHERE id=?", (product_id,))
-                    rows_deleted = cursor.rowcount
-                    conn.commit()  # التأكيد على حفظ التغييرات
-                    
-                    if rows_deleted == 0:
-                        show_snackbar("لم يتم حذف أي منتج!")
-                        page.close(dlg)
-                        return
-                    
-                    # 3. حذف الصورة المرتبطة إذا وجدت
-                    if image_path and os.path.exists(image_path):
-                        try:
-                            os.remove(image_path)
-                            # حذف الصورة المصغرة إذا كانت موجودة
-                            thumbnail_path = os.path.join(IMAGES_FOLDER, "thumb_" + os.path.basename(image_path))
-                            if os.path.exists(thumbnail_path):
-                                os.remove(thumbnail_path)
-                        except Exception as img_err:
-                            pass
-
-                # 4. إرسال إشعار
-                message = f"تم حذف المنتج:\n{product_name}"
-                threading.Thread(
-                    target=lambda: send_telegram_notification(message),
-                    daemon=True
-                ).start()
-
-                # 5. تحديث الواجهة
-                show_snackbar(f"تم حذف {product_name} بنجاح")
-                refresh_edit_products()
-                
-                # 6. إغلاق الحوار
-                page.close(dlg)
-
-            except sqlite3.Error as db_err:
-                
-                show_snackbar(f"خطأ في قاعدة البيانات: {db_err}")
-            except Exception as ex:
-                
-                show_snackbar(f"خطأ غير متوقع: {ex}")
-            finally:
-                page.update()
-
-        # إنشاء حوار التأكيد
-        dlg = AlertDialog(
-            modal=True,
-            title=Text("تأكيد الحذف", weight=FontWeight.BOLD),
-            content=Column([
-                Text("سيتم حذف المنتج التالي نهائياً:", size=16),
-                Text(product_name, size=18, weight=FontWeight.BOLD, color=Colors.RED_700),
-                Text("لا يمكن التراجع عن هذه العملية!", size=14, color=Colors.RED)
-            ], tight=True),
-            actions=[
-                TextButton("إلغاء", on_click=lambda e: page.close(dlg)),
-                TextButton(
-                    "تأكيد الحذف",
-                    on_click=confirm_delete,
-                    style=ButtonStyle(color=Colors.RED)
+    # تبويب لوحة التحكم الرئيسية
+    dashboard_tab = ft.Tab(
+        text="Dashboard",  # اسم التبويب
+        content=ft.Container(  # محتوى التبويب
+            ft.Column([  # ترتيب عمودي
+                # الهيدر العلوي
+                ft.Container(
+                    ft.Row([  # ترتيب أفقي
+                        ft.Icon(ft.Icons.MONITOR_HEART, size=35, color=ft.Colors.BLUE_700),  # أيقونة البرنامج
+                        ft.Column([  # عمود للنصوص
+                            ft.Text("System Health Monitor", size=25, weight=ft.FontWeight.BOLD),  # عنوان
+                            ft.Text("Real-time system monitoring", size=10, color=ft.Colors.GREY_600),  # وصف
+                        ])
+                    ]),
+                    padding=15,  # مسافات داخلية
+                    bgcolor=ft.Colors.BLUE_50,  # لون خلفية أزرق فاتح
+                    border_radius=15  # زوايا دائرية
                 ),
-            ],
-            actions_alignment=MainAxisAlignment.END,
+                # صف أول: المعالج والذاكرة
+                ft.Row([cpu_card, ram_card], alignment=ft.MainAxisAlignment.CENTER),
+                # صف ثاني: البطارية ودرجة الحرارة
+                ft.Row([batt_card, temp_card], alignment=ft.MainAxisAlignment.CENTER),
+                # صف ثالث: كرت الشاشة والشبكة
+                ft.Row([gpu_card, net_card], alignment=ft.MainAxisAlignment.CENTER),
+                # حالة المراقبة في الأسفل
+                ft.Container(status_text, alignment=ft.alignment.center, padding=20)
+            ])
+        )
+    )
+
+    # عناصر الإعدادات للنصوص المعروضة
+    cpu_alert_text = ft.Text(f"{cfg.get('cpu_alert', 85)}%", size=16, color=ft.Colors.BLUE_700)  # نص تنبيه المعالج
+    ram_alert_text = ft.Text(f"{cfg.get('ram_alert', 85)}%", size=16, color=ft.Colors.GREEN_700)  # نص تنبيه الذاكرة
+    batt_alert_text = ft.Text(f"{cfg.get('battery_alert', 15)}%", size=16, color=ft.Colors.ORANGE_700)  # نص تنبيه البطارية
+    temp_alert_text = ft.Text(f"{cfg.get('temp_alert', 85)}°C", size=16, color=ft.Colors.RED_700)  # نص تنبيه الحرارة
+
+    # دالة لتحديث الإعدادات
+    def update_setting(key, value, text_widget=None):
+        cfg[key] = value  # تحديث القيمة في الإعدادات
+        if text_widget:  # لو فيه نص معروض يتبعه
+            text_widget.value = f"{value}%" if key != 'temp_alert' else f"{value}°C"  # تحديث النص
+        page.update()  # حدث الواجهة
+
+    # دالة لحفظ كل الإعدادات
+    def save_all_settings(e):
+        if save_config(cfg):  # حاول حفظ الإعدادات
+            show_system_notification("Settings Saved", "All configuration settings have been saved successfully.")  # إشعار
+            show_alert_dialog("Success", "Settings saved successfully!")  # نافذة تأكيد
+
+    # دالة لإنشاء عناصر التحكم في الإعدادات
+    def create_setting_slider(label, key, min_v, max_v, color, unit, text_widget):
+        return ft.Container(
+            ft.Column([
+                # صف يحتوي على التسمية والقيمة الحالية
+                ft.Row([
+                    ft.Text(label, size=16, weight=ft.FontWeight.BOLD, color=color),  # تسمية الإعداد
+                    text_widget  # القيمة الحالية
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),  # مسافة بينهم
+                # شريط التمرير لتعديل القيمة
+                ft.Slider(
+                    min=min_v, max=max_v, divisions=int(max_v - min_v),  # الحد الأدنى والأقصى
+                    value=cfg.get(key, DEFAULT_CONFIG[key]),  # القيمة الحالية
+                    active_color=color,  # لون الشريط
+                    on_change=lambda e: update_setting(key, e.control.value, text_widget)  # حدث التغيير
+                ),
+            ], spacing=5),  # مسافة بين العناصر
+            padding=10, border_radius=10, bgcolor=ft.Colors.GREY_100, margin=ft.margin.only(bottom=10)  # إعدادات التنسيق
         )
 
-        # فتح الحوار
-        page.dialog = dlg
-        page.open(dlg)
-
-    def buy_product(product_id, product_name):
-        try:
-            with sqlite3.connect(DB_PATH) as conn:
-                quantity = conn.execute(
-                    "SELECT quantity FROM products WHERE id=?",
-                    (product_id,)
-                ).fetchone()[0]
-                
-                if quantity <= 0:
-                    show_snackbar("الكمية غير متاحة")
-                    return
-                
-                conn.execute(
-                    "UPDATE products SET quantity=quantity-1, sold=sold+1 WHERE id=?",
-                    (product_id,)
+    # تبويب الإعدادات والتنبيهات
+    settings_tab = ft.Tab(
+        text="Settings & Alerts",  # اسم التبويب
+        content=ft.Container(
+            ft.Column([
+                ft.Text("Alert Settings", size=22, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_700),  # عنوان القسم
+                ft.Divider(),  # خط فاصل
+                # شرائط التحكم في حدود التنبيهات
+                create_setting_slider("CPU Alert Threshold", "cpu_alert", 50, 100, ft.Colors.BLUE_700, "%", cpu_alert_text),
+                create_setting_slider("RAM Alert Threshold", "ram_alert", 50, 100, ft.Colors.GREEN_700, "%", ram_alert_text),
+                create_setting_slider("Battery Alert", "battery_alert", 5, 80, ft.Colors.ORANGE_700, "%", batt_alert_text),
+                create_setting_slider("Temperature Alert", "temp_alert", 60, 95, ft.Colors.RED_700, "°C", temp_alert_text),
+                ft.Divider(),  # خط فاصل
+                # مفاتيح تبديل الخيارات
+                ft.Row([
+                    ft.Switch(label="Enable Alerts", value=cfg.get("show_alerts", True),  # تفعيل/تعطيل التنبيهات
+                              on_change=lambda e: update_setting("show_alerts", e.control.value)),
+                    ft.Switch(label="System Notifications", value=cfg.get("system_notifications", True),  # إشعارات النظام
+                              on_change=lambda e: update_setting("system_notifications", e.control.value)),
+                ], alignment=ft.MainAxisAlignment.SPACE_EVENLY),
+                ft.Row([
+                    ft.Switch(label="Monitor GPU", value=cfg.get("enable_gpu", True),  # مراقبة كرت الشاشة
+                              on_change=lambda e: update_setting("enable_gpu", e.control.value)),
+                    ft.Switch(label="Monitor Network", value=cfg.get("enable_wifi", True),  # مراقبة الشبكة
+                              on_change=lambda e: update_setting("enable_wifi", e.control.value)),
+                ], alignment=ft.MainAxisAlignment.SPACE_EVENLY),
+                # زر حفظ الإعدادات
+                ft.Container(
+                    ft.ElevatedButton(
+                        "Save Config",  # نص الزر
+                        on_click=save_all_settings,  # حدث الضغط
+                        bgcolor=ft.Colors.BLUE_700,  # لون خلفية أزرق
+                        color="white",  # لون النص أبيض
+                        style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=12))  # زوايا دائرية
+                    ),
+                    alignment=ft.alignment.center,  # توسيط الزر
+                    padding=20  # مسافات حول الزر
                 )
-                
-                conn.execute(
-                    "INSERT INTO sales (product_id, quantity) VALUES (?, 1)",
-                    (product_id,)
-                )
-            
-            message = f"تم بيع منتج:\n{product_name}\nالكمية المتبقية: {quantity-1}"
-            send_telegram_notification(message)
-            
-            show_snackbar(f"تم بيع {product_name} بنجاح")
-            refresh_products()
-        except Exception as e:
-            show_snackbar(f"خطأ في تسجيل البيع: {str(e)}")
-
-    def buy_selected_products():
-        if not selected_products:
-            show_snackbar("لم يتم اختيار أي منتجات")
-            return
-        
-        try:
-            sold_out_products = []  # لتخزين المنتجات التي انتهت
-            with sqlite3.connect(DB_PATH) as conn:
-                # التحقق أولاً من توفر جميع الكميات
-                for product_id, (price, quantity) in selected_products.items():
-                    available = conn.execute(
-                        "SELECT name, quantity FROM products WHERE id=?",
-                        (product_id,)
-                    ).fetchone()
-                    
-                    if available[1] < quantity:
-                        show_snackbar(f"الكمية غير كافية للمنتج {available[0]}")
-                        return
-                
-                # تنفيذ عمليات البيع
-                for product_id, (price, quantity) in selected_products.items():
-                    conn.execute(
-                        "UPDATE products SET quantity=quantity-?, sold=sold+? WHERE id=?",
-                        (quantity, quantity, product_id)
-                    )
-                    
-                    conn.execute(
-                        "INSERT INTO sales (product_id, quantity) VALUES (?, ?)",
-                        (product_id, quantity)
-                    )
-                    
-                    # التحقق إذا انتهت الكمية
-                    remaining = conn.execute(
-                        "SELECT name, quantity FROM products WHERE id=?",
-                        (product_id,)
-                    ).fetchone()
-                    
-                    if remaining[1] <= 0:
-                        sold_out_products.append(remaining[0])
-            
-            # إرسال إشعارات
-            total = sum(price * qty for price, qty in selected_products.values())
-            message = f"تم بيع {len(selected_products)} منتجات\nالمجموع: {total} درهم"
-            
-            if sold_out_products:
-                message += "\n\n⚠️ المنتجات التالية انتهت:\n" + "\n".join(sold_out_products)
-            
-            send_telegram_notification(message)
-            
-            # تحديث الواجهة
-            selected_products.clear()
-            update_total_banner()
-            show_snackbar("تم تسجيل المبيعات بنجاح")
-            refresh_products()
-            
-        except Exception as e:
-            show_snackbar(f"خطأ في تسجيل المبيعات: {str(e)}")
-
-    
-
-    def update_total_banner():
-        if selected_products:
-            total = sum(price * qty for price, qty in selected_products.values())
-            total_price_banner.content.controls[1].value = str(total)
-            total_price_banner.visible = True
-        else:
-            total_price_banner.visible = False
-        page.update()
-
-    def show_snackbar(message, is_error=False):
-        page.snack_bar = SnackBar(
-            content=Text(message, color=Colors.WHITE),
-            bgcolor=Colors.RED_700 if is_error else Colors.GREEN_700,
-            behavior=SnackBarBehavior.FLOATING,
-            elevation=10,
-            shape=RoundedRectangleBorder(radius=10),
-            show_close_icon=True,
-            duration=4000  # 4 ثواني
+            ], scroll=ft.ScrollMode.ADAPTIVE)  # إمكانية التمرير لو المحتوى طويل
         )
-        page.snack_bar.open = True
-        page.update()
+    )
 
-    def navigate_to(index):
-        nonlocal current_view
-        
-        # تأكد من أن الصفحة موجودة
-        if not page:
-            return
-            
-        # قم بمسح الصفحة الحالية أولاً
-        page.clean()
-        
-        # تهيئة العناصر حسب الفهرس المحدد
-        if index == 0:  # المنتجات
-            current_view = "products"
-            refresh_products()  # تأكد من تهيئة products_page أولاً
-            content = products_page
-        elif index == 1:  # إضافة منتج
-            current_view = "add_product"
-            content = add_product_page
-        elif index == 2:  # تعديل المنتجات
-            current_view = "edit_products"
-            refresh_edit_products()  # تأكد من تهيئة edit_page أولاً
-            content = edit_page
-        elif index == 3:  # إعدادات البوت
-            current_view = "bot_settings"
-            content = create_bot_settings_page()
-        elif index == 4:  # إدارة المسؤولين
-            current_view = "admin_management"
-            content = create_admin_management_page()
-        else:
-            return
-            
-        # تأكد من أن المحتوى ليس None قبل إضافته
-        if content is not None:
-            page.add(
-                Row(
-                    [
-                        create_nav_rail(index),
-                        VerticalDivider(width=1),
-                        Container(
-                            content=content,
-                            expand=True,
-                            padding=20
-                        )
-                    ],
-                    expand=True
-                )
-            )
-        else:
-            pass
+    # إنشاء التبويبات وإضافتها للصفحة
+    tabs = ft.Tabs(selected_index=0, tabs=[dashboard_tab, settings_tab], expand=True)
+    page.add(tabs)
 
-    def start_telegram_bot():
-        from telegram import BotCommand
-        from telegram.ext import (
-            ApplicationBuilder,
-            CommandHandler,
-            MessageHandler,
-            ContextTypes,
-            filters,
-            ConversationHandler
-        )
-        from telegram import Update
-        import sqlite3
-        import os
-        import asyncio
-        import threading
+    # بدء المراقبة في خيط منفصل علشان ما توقف الواجهة
+    threading.Thread(target=monitor_loop, daemon=True).start()
 
-        global telegram_bot_thread, telegram_bot_app, telegram_bot_loop
-
-        # حالات المحادثة
-        PRODUCT_NAME, PRODUCT_PRICE, PRODUCT_QUANTITY, PRODUCT_IMAGE = range(4)
-        EDIT_PRODUCT_ID, EDIT_PRODUCT_DATA = range(4, 6)
-        DELETE_PRODUCT_ID = 6
-
-        # تأكد من عدم تشغيل البوت مسبقاً
-        if telegram_bot_thread and telegram_bot_thread.is_alive():
-            pass
-            return
-        
-        # تحقق من وجود إعدادات البوت
-        with sqlite3.connect(SETTINGS_DB_PATH) as conn:
-            settings = conn.execute(
-                "SELECT bot_token, chat_id FROM telegram_bot ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-        
-        if not settings or not settings[0]:
-            pass
-            return
-
-        async def download_image(bot, file_id, product_id):
-            try:
-                os.makedirs(IMAGES_FOLDER, exist_ok=True)
-                filename = f"{product_id}.jpg"
-                destination = os.path.join(IMAGES_FOLDER, filename)
-                
-                # الحصول على كائن الملف من file_id
-                file = await bot.get_file(file_id)
-                await file.download_to_drive(destination)
-                
-                return destination
-            except Exception as e:
-                
-                return None
-
-        async def run_bot():
-            global telegram_bot_app, telegram_bot_loop
-            try:
-                telegram_bot_loop = asyncio.get_running_loop()
-                bot_token = settings[0]
-
-                # متغيرات حالة المنتج المؤقت
-                temp_product = {}
-
-                async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    user_id = str(update.effective_user.id)
-                    if is_admin(user_id):
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text=f"مرحباً بك في نظام إدارة المنتجات!\nمعرفك: {user_id}\nاستخدم /help لرؤية الأوامر المتاحة"
-                        )
-                    else:
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text="ليس لديك صلاحية الوصول لهذا البوت. الرجاء التواصل مع المسؤول."
-                        )
-
-                async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    if not is_admin(str(update.effective_user.id)):
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text="ليس لديك صلاحية الوصول لهذا البوت"
-                        )
-                        return
-
-                    help_text = """
-                    🛍️ أوامر إدارة المتجر:
-                    
-                    /start - بدء استخدام البوت
-                    /help - عرض هذه الرسالة
-                    /id - عرض معرفك
-                    
-                    📦 أوامر المنتجات:
-                    /add - إضافة منتج جديد (مع صورة)
-                    /quickadd - إضافة منتج سريع (بدون صورة)
-                    /list - عرض جميع المنتجات
-                    /edit - تعديل منتج
-                    /delete - حذف منتج
-                    /sales - عرض المبيعات
-                    """
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id, 
-                        text=help_text,
-                        parse_mode="Markdown"
-                    )
-
-                async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    user_id = update.effective_user.id
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=f"🔑 معرفك هو:\n`{user_id}`\n\nشارك هذا المعرف مع المسؤول لإضافتك كمسؤول في النظام.",
-                        parse_mode="Markdown"
-                    )
-
-                async def add_product_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    if not is_admin(str(update.effective_user.id)):
-                        await update.message.reply_text("⛔ ليس لديك صلاحية استخدام هذا الأمر")
-                        return ConversationHandler.END
-                    
-                    await update.message.reply_text("📝 الرجاء إرسال اسم المنتج:")
-                    return PRODUCT_NAME
-
-                async def product_name_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    temp_product['name'] = update.message.text
-                    await update.message.reply_text("💰 الرجاء إرسال سعر المنتج:")
-                    return PRODUCT_PRICE
-
-                async def product_price_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    try:
-                        temp_product['price'] = float(update.message.text)
-                        await update.message.reply_text("🛒 الرجاء إرسال كمية المنتج المتاحة:")
-                        return PRODUCT_QUANTITY
-                    except ValueError:
-                        await update.message.reply_text("❌ السعر يجب أن يكون رقماً! الرجاء إعادة المحاولة:")
-                        return PRODUCT_PRICE
-
-                async def product_quantity_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    try:
-                        temp_product['quantity'] = int(update.message.text)
-                        await update.message.reply_text("📸 الرجاء إرسال صورة المنتج (أو /skip لتخطي إضافة صورة):")
-                        return PRODUCT_IMAGE
-                    except ValueError:
-                        await update.message.reply_text("❌ الكمية يجب أن تكون رقماً صحيحاً! الرجاء إعادة المحاولة:")
-                        return PRODUCT_QUANTITY
-
-                async def product_image_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    if update.message.photo:
-                        try:
-                            with sqlite3.connect(DB_PATH) as conn:
-                                cursor = conn.cursor()
-                                cursor.execute(
-                                    "INSERT INTO products (name, price, quantity) VALUES (?, ?, ?)",
-                                    (temp_product['name'], temp_product['price'], temp_product['quantity'])
-                                )
-                                product_id = cursor.lastrowid
-                                
-                                # الحصول على أعلى دقة صورة متاحة (آخر عنصر في القائمة)
-                                photo = update.message.photo[-1]
-                                image_path = await download_image(context.bot, photo.file_id, product_id)
-                                
-                                if image_path:
-                                    conn.execute(
-                                        "UPDATE products SET image = ? WHERE id = ?",
-                                        (image_path, product_id)
-                                    )
-                            
-                            await update.message.reply_text(
-                                f"✅ تمت إضافة المنتج بنجاح:\n\n"
-                                f"📌 الاسم: {temp_product['name']}\n"
-                                f"💰 السعر: {temp_product['price']} درهم\n"
-                                f"🛒 الكمية: {temp_product['quantity']}\n"
-                                f"🖼️ تم حفظ الصورة"
-                            )
-                            
-                        except Exception as e:
-                            await update.message.reply_text(f"❌ حدث خطأ أثناء حفظ المنتج: {str(e)}")
-                    else:
-                        await update.message.reply_text("❌ لم يتم إرسال صورة صالحة")
-                    
-                    temp_product.clear()
-                    return ConversationHandler.END
-
-                async def skip_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    try:
-                        with sqlite3.connect(DB_PATH) as conn:
-                            conn.execute(
-                                "INSERT INTO products (name, price, quantity) VALUES (?, ?, ?)",
-                                (temp_product['name'], temp_product['price'], temp_product['quantity'])
-                            )
-                        
-                        await update.message.reply_text(
-                            f"✅ تمت إضافة المنتج بنجاح (بدون صورة):\n\n"
-                            f"📌 الاسم: {temp_product['name']}\n"
-                            f"💰 السعر: {temp_product['price']} درهم\n"
-                            f"🛒 الكمية: {temp_product['quantity']}"
-                        )
-                    
-                    except Exception as e:
-                        await update.message.reply_text(f"❌ حدث خطأ أثناء حفظ المنتج: {str(e)}")
-                    
-                    finally:
-                        temp_product.clear()
-                        return ConversationHandler.END
-
-                async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    temp_product.clear()
-                    await update.message.reply_text("❌ تم إلغاء العملية")
-                    return ConversationHandler.END
-
-                async def quick_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    if not is_admin(str(update.effective_user.id)):
-                        await update.message.reply_text("⛔ ليس لديك صلاحية استخدام هذا الأمر")
-                        return
-
-                    await update.message.reply_text(
-                        "📝 أرسل بيانات المنتج بالشكل التالي:\n\n`اسم المنتج|السعر|الكمية`\n\nمثال:\n`حذاء رياضي|120.5|15`",
-                        parse_mode="Markdown"
-                    )
-
-                async def handle_quick_product_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    if not is_admin(str(update.effective_user.id)):
-                        return
-
-                    try:
-                        parts = update.message.text.split('|')
-                        if len(parts) != 3:
-                            await update.message.reply_text(
-                                "❌ صيغة غير صحيحة. استخدم:\n`اسم المنتج|السعر|الكمية`",
-                                parse_mode="Markdown"
-                            )
-                            return
-
-                        name, price, quantity = parts
-                        price = float(price.strip())
-                        quantity = int(quantity.strip())
-
-                        with sqlite3.connect(DB_PATH) as conn:
-                            conn.execute(
-                                "INSERT INTO products (name, price, quantity) VALUES (?, ?, ?)",
-                                (name.strip(), price, quantity)
-                            )
-
-                        await update.message.reply_text(
-                            f"""✅ تمت إضافة المنتج بنجاح:
-                            
-    📌 الاسم: {name}
-    💰 السعر: {price} درهم
-    🛒 الكمية: {quantity}"""
-                        )
-                        
-                        if settings and settings[1]:
-                            try:
-                                bot = Bot(token=settings[0])
-                                await bot.send_message(
-                                    chat_id=settings[1],
-                                    text=f"تمت إضافة منتج جديد:\n{name}\nالسعر: {price} درهم\nالكمية: {quantity}"
-                                )
-                            except Exception as e:
-                                pass
-
-                    except ValueError:
-                        await update.message.reply_text("❌ خطأ في القيم المدخلة! تأكد أن السعر رقم والكمية عدد صحيح")
-                    except Exception as e:
-                        await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
-
-                async def list_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    with sqlite3.connect(DB_PATH) as conn:
-                        products = conn.execute(
-                            "SELECT id, name, price, quantity FROM products ORDER BY name"
-                        ).fetchall()
-
-                    if not products:
-                        await update.message.reply_text("⚠️ لا توجد منتجات مسجلة بعد")
-                        return
-
-                    response = "📦 قائمة المنتجات:\n\n"
-                    for product in products:
-                        response += f"🆔 {product[0]}\n📌 {product[1]}\n💰 {product[2]} درهم\n🛒 المتاح: {product[3]}\n------------------------\n"
-
-                    await update.message.reply_text(response)
-
-                async def edit_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    if not is_admin(str(update.effective_user.id)):
-                        await update.message.reply_text("⛔ ليس لديك صلاحية استخدام هذا الأمر")
-                        return ConversationHandler.END
-                    
-                    await update.message.reply_text(
-                        "🆔 الرجاء إرسال ID المنتج الذي تريد تعديله:\n\n"
-                        "استخدم /list لرؤية قائمة المنتجات وأرقامها\n"
-                        "أو /cancel للإلغاء"
-                    )
-                    return EDIT_PRODUCT_ID
-
-                async def edit_product_id_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    try:
-                        product_id = int(update.message.text)
-                        context.user_data['edit_product_id'] = product_id
-                        
-                        with sqlite3.connect(DB_PATH) as conn:
-                            product = conn.execute(
-                                "SELECT name, price, quantity FROM products WHERE id = ?",
-                                (product_id,)
-                            ).fetchone()
-                        
-                        if not product:
-                            await update.message.reply_text("⚠️ لا يوجد منتج بهذا الرقم")
-                            return ConversationHandler.END
-                            
-                        context.user_data['current_product'] = product
-                        await update.message.reply_text(
-                            f"📝 المنتج الحالي:\n"
-                            f"الاسم: {product[0]}\n"
-                            f"السعر: {product[1]}\n"
-                            f"الكمية: {product[2]}\n\n"
-                            "أرسل البيانات الجديدة بالشكل التالي:\n"
-                            "`اسم المنتج|السعر|الكمية`\n\n"
-                            "أو /cancel للإلغاء",
-                            parse_mode="Markdown"
-                        )
-                        return EDIT_PRODUCT_DATA
-
-                    except ValueError:
-                        await update.message.reply_text("❌ الرجاء إدخال رقم صحيح")
-                        return EDIT_PRODUCT_ID
-                    except Exception as e:
-                        await update.message.reply_text(f"❌ حدث خطأ: {str(e)}")
-                        return ConversationHandler.END
-
-                async def edit_product_data_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    try:
-                        parts = update.message.text.split('|')
-                        if len(parts) != 3:
-                            await update.message.reply_text(
-                                "❌ صيغة غير صحيحة. استخدم:\n`اسم المنتج|السعر|الكمية`",
-                                parse_mode="Markdown"
-                            )
-                            return EDIT_PRODUCT_DATA
-
-                        name, price, quantity = parts
-                        product_id = context.user_data['edit_product_id']
-                        
-                        with sqlite3.connect(DB_PATH) as conn:
-                            conn.execute(
-                                "UPDATE products SET name=?, price=?, quantity=? WHERE id=?",
-                                (name.strip(), float(price.strip()), int(quantity.strip()), product_id)
-                            )
-                        
-                        await update.message.reply_text(
-                            f"✅ تم تحديث المنتج بنجاح:\n\n"
-                            f"🆔 الرقم: {product_id}\n"
-                            f"📌 الاسم: {name}\n"
-                            f"💰 السعر: {price} درهم\n"
-                            f"🛒 الكمية: {quantity}"
-                        )
-                        
-                    except ValueError:
-                        await update.message.reply_text("❌ خطأ في القيم المدخلة! تأكد أن السعر رقم والكمية عدد صحيح")
-                        return EDIT_PRODUCT_DATA
-                    except Exception as e:
-                        await update.message.reply_text(f"❌ حدث خطأ أثناء التعديل: {str(e)}")
-                    finally:
-                        context.user_data.clear()
-                        return ConversationHandler.END
-
-                async def delete_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    if not is_admin(str(update.effective_user.id)):
-                        await update.message.reply_text("⛔ ليس لديك صلاحية استخدام هذا الأمر")
-                        return ConversationHandler.END
-                    
-                    await update.message.reply_text(
-                        "🗑️ الرجاء إرسال ID المنتج الذي تريد حذفه:\n\n"
-                        "استخدم /list لرؤية قائمة المنتجات وأرقامها\n"
-                        "أو /cancel للإلغاء"
-                    )
-                    return DELETE_PRODUCT_ID
-
-                async def delete_product_id_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    try:
-                        product_id = int(update.message.text)
-                        
-                        with sqlite3.connect(DB_PATH) as conn:
-                            product = conn.execute(
-                                "SELECT name, image FROM products WHERE id = ?",
-                                (product_id,)
-                            ).fetchone()
-                            
-                            if not product:
-                                await update.message.reply_text("⚠️ لا يوجد منتج بهذا الرقم")
-                                return ConversationHandler.END
-                                
-                            conn.execute(
-                                "DELETE FROM products WHERE id = ?",
-                                (product_id,)
-                            )
-                            
-                            if product[1] and os.path.exists(product[1]):
-                                try:
-                                    os.remove(product[1])
-                                except Exception as e:
-                                    pass
-                        
-                        await update.message.reply_text(
-                            f"✅ تم حذف المنتج بنجاح:\n{product[0]}"
-                        )
-                        
-                    except ValueError:
-                        await update.message.reply_text("❌ الرجاء إدخال رقم صحيح")
-                        return DELETE_PRODUCT_ID
-                    except Exception as e:
-                        await update.message.reply_text(f"❌ حدث خطأ أثناء الحذف: {str(e)}")
-                    finally:
-                        return ConversationHandler.END
-
-                async def show_sales(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    if not is_admin(str(update.effective_user.id)):
-                        await update.message.reply_text("⛔ ليس لديك صلاحية استخدام هذا الأمر")
-                        return
-
-                    with sqlite3.connect(DB_PATH) as conn:
-                        total_sales = conn.execute(
-                            "SELECT COUNT(*) FROM sales"
-                        ).fetchone()[0]
-                        
-                        total_revenue = conn.execute(
-                            "SELECT SUM(p.price * s.quantity) FROM sales s JOIN products p ON s.product_id = p.id"
-                        ).fetchone()[0] or 0
-                        
-                        top_products = conn.execute(
-                            """SELECT p.name, SUM(s.quantity) as sold 
-                            FROM sales s JOIN products p ON s.product_id = p.id 
-                            GROUP BY p.name 
-                            ORDER BY sold DESC 
-                            LIMIT 5"""
-                        ).fetchall()
-
-                    response = f"💰 إحصائيات المبيعات:\n\n"
-                    response += f"🛒 إجمالي المبيعات: {total_sales}\n"
-                    response += f"💵 إجمالي الإيرادات: {total_revenue:.2f} درهم\n\n"
-                    response += "🏆 أفضل المنتجات مبيعاً:\n"
-                    
-                    for i, (name, sold) in enumerate(top_products, 1):
-                        response += f"{i}. {name} - {sold} وحدة\n"
-
-                    await update.message.reply_text(response)
-
-                # إعداد معالجات المحادثة
-                add_conv_handler = ConversationHandler(
-                    entry_points=[CommandHandler('add', add_product_start)],
-                    states={
-                        PRODUCT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_name_received)],
-                        PRODUCT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_price_received)],
-                        PRODUCT_QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_quantity_received)],
-                        PRODUCT_IMAGE: [
-                            MessageHandler(filters.PHOTO, product_image_received),
-                            CommandHandler('skip', skip_image)
-                        ],
-                    },
-                    fallbacks=[CommandHandler('cancel', cancel)],
-                )
-
-                edit_conv_handler = ConversationHandler(
-                    entry_points=[CommandHandler('edit', edit_product)],
-                    states={
-                        EDIT_PRODUCT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_product_id_received)],
-                        EDIT_PRODUCT_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_product_data_received)],
-                    },
-                    fallbacks=[CommandHandler('cancel', cancel)],
-                )
-
-                delete_conv_handler = ConversationHandler(
-                    entry_points=[CommandHandler('delete', delete_product)],
-                    states={
-                        DELETE_PRODUCT_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_product_id_received)],
-                    },
-                    fallbacks=[CommandHandler('cancel', cancel)],
-                )
-
-                # إعداد التطبيق
-                telegram_bot_app = ApplicationBuilder().token(bot_token).build()
-
-                # إضافة المعالجات
-                handlers = [
-                    add_conv_handler,
-                    edit_conv_handler,
-                    delete_conv_handler,
-                    CommandHandler("start", start),
-                    CommandHandler("help", help_command),
-                    CommandHandler("id", id_command),
-                    CommandHandler("quickadd", quick_add_product),
-                    CommandHandler("list", list_products),
-                    CommandHandler("sales", show_sales),
-                    MessageHandler(filters.TEXT & (~filters.COMMAND), handle_quick_product_input),
-                ]
-                
-                for handler in handlers:
-                    telegram_bot_app.add_handler(handler)
-
-                # إعداد قائمة الأوامر
-                await telegram_bot_app.bot.set_my_commands([
-                    BotCommand("start", "بدء الاستخدام"),
-                    BotCommand("help", "عرض الأوامر"),
-                    BotCommand("add", "إضافة منتج (مع صورة)"),
-                    BotCommand("quickadd", "إضافة منتج سريع"),
-                    BotCommand("list", "عرض المنتجات"),
-                    BotCommand("delete", "حذف منتج"),
-                    BotCommand("edit", "تعديل منتج"),
-                    BotCommand("sales", "عرض المبيعات"),
-                    BotCommand("id", "عرض معرفك")
-                ])
-
-                # تشغيل البوت
-                await telegram_bot_app.initialize()
-                await telegram_bot_app.start()
-                
-                
-                if settings and settings[1]:
-                    try:
-                        await telegram_bot_app.bot.send_message(
-                            chat_id=settings[1],
-                            text="🤖 تم تشغيل بوت إدارة المتجر بنجاح"
-                        )
-                    except Exception as e:
-                        pass
-                
-                await telegram_bot_app.updater.start_polling()
-                await asyncio.Event().wait()
-
-            except Exception as e:
-                
-                if settings and settings[1]:
-                    try:
-                        bot = Bot(token=settings[0])
-                        await bot.send_message(
-                            chat_id=settings[1],
-                            text=f"❌ حدث خطأ في تشغيل البوت:\n{str(e)}"
-                        )
-                    except:
-                        pass
-            finally:
-                telegram_bot_app = None
-                telegram_bot_loop = None
-
-        def run_async():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(run_bot())
-            loop.close()
-
-        telegram_bot_thread = threading.Thread(target=run_async, daemon=True)
-        telegram_bot_thread.start()
-        
-
-    def stop_telegram_bot():
-        global telegram_bot_app, telegram_bot_thread, telegram_bot_loop
-        
-        if telegram_bot_app:
-            try:
-                asyncio.run_coroutine_threadsafe(telegram_bot_app.stop(), telegram_bot_loop)
-                telegram_bot_thread.join(timeout=5)
-                telegram_bot_app = None
-                telegram_bot_thread = None
-                telegram_bot_loop = None
-                
-                
-                with sqlite3.connect(SETTINGS_DB_PATH) as conn:
-                    settings = conn.execute(
-                        "SELECT bot_token, chat_id FROM telegram_bot ORDER BY id DESC LIMIT 1"
-                    ).fetchone()
-                    
-                if settings and settings[0] and settings[1]:
-                    try:
-                        bot = Bot(token=settings[0])
-                        asyncio.run(bot.send_message(
-                            chat_id=settings[1],
-                            text="🛑 تم إيقاف بوت إدارة المتجر"
-                        ))
-                    except Exception as e:
-                        pass
-                        
-            except Exception as e:
-                pass
-
-    def restart_telegram_bot():
-        stop_telegram_bot()
-        start_telegram_bot()
-    start_telegram_bot()
-    navigate_to(0)
-
-app(target=main,assets_dir='assets')
+# تشغيل البرنامج لما ننفذ الملف مباشر
+if __name__ == "__main__":
+    ft.app(target=main)
